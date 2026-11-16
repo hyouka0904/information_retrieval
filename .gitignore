@@ -1,4 +1,15 @@
+# raw collection and archives
+*.warc.gz
 *.zip
-*.warc.gz
 
-*.warc.gz
+# generated index and preprocessing output (rebuilt by build.py)
+output/
+
+# packaged submission
+dist/
+
+# Python / Jupyter / venv
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
