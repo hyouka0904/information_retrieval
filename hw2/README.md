@@ -1,6 +1,6 @@
 # IR HW2：Query Processing and Searching
 
-接續 HW1 的 positional inverted index，對使用者的 query 回傳依 TF-IDF + cosine similarity 排序的結果（投影片第 4、5 頁）。另外實作 BM25、champion lists、tiered index、phrase / proximity / wildcard / 複雜 Boolean、拼字與發音修正等加分項（完整列表見「加分項完成狀況」）。HW1 的 index 不用重建：前處理（`prep.py` 或 `hw2_index_prep.ipynb`）補上 HW2 需要的統計量，之後的查詢都是讀這些小檔案，postings 則依 byte offset 從硬碟隨讀隨用。
+接續 HW1 的 positional inverted index，對使用者的 query 回傳依 TF-IDF + cosine similarity 排序的結果（投影片第 4、5 頁）。另外實作 BM25、champion lists、tiered index、phrase / proximity / wildcard / 複雜 Boolean、拼字與發音修正等加分項（完整列表見「加分項完成狀況」）。index 由 HW1 原封不動的 `hw1_indexer.py` 從 WARC 建出，前處理（`prep.py` 或 `hw2_index_prep.ipynb`）再補上 HW2 需要的統計量；之後的查詢都是讀這些小檔案，postings 則依 byte offset 從硬碟隨讀隨用。整條流程（建 index → 前處理 → 產生結果 → 打包）由 `build.py` 一個指令完成，見「建置流程（build.py）」。
 
 ## 組員
 
@@ -14,14 +14,14 @@
 壓縮檔已經包含完整的 index 和所有前處理結果（`output/`），**不需要 WARC 檔，也不需要跑任何前處理**。
 
 ```
-cd team27_hw2
+cd <ID>_HW2                          # 解壓後的資料夾，名稱和壓縮檔相同
 pip install -r requirements.txt
 python search.py                     # 出現 cmd> 後輸入 query，例如 Hong Kong business；exit 結束
 ```
 
 - 需要 Python 3.8 以上。
 - 不需要網路。NLTK 的 stopwords 已經放在 `nltk_data/`，程式會自動使用。HW1 的程式啟動時仍會嘗試下載 wordnet 和 omw-1.4，離線時會印出幾行 `[nltk_data] Error loading ...`，這是正常的：這兩份資料只有 lemmatization 會用到，而這份 index 沒有開啟 lemmatization，查詢結果不受影響。
-- 第一次查詢約需 0.1 秒到數百毫秒（postings 還沒進入 OS 的 disk cache），之後每個 query 約 15 ms。
+- 第一次查詢約需 0.1 秒到數百毫秒（postings 還沒進入 OS 的 disk cache），之後每個 query 約 15 – 20 ms。
 - 預設會檢查拼字：發現疑似拼錯的字時，只在 stderr 印出 `# did you mean: ...`，**排序結果仍然是原本輸入的 query 的結果**，所以不會影響評分。要讓程式自動修正後再搜尋，加上 `--spell correct`；完全關閉則用 `--spell off`。
 
 投影片要求的 ranked list 輸出在 `results/results.txt`，是用 `queries.txt`（投影片上的範例 query 加上幾個加分項的 query）跑出來的。`results/` 的每個檔案都可以用下表的指令重新產生，重跑後應該和壓縮檔裡的檔案逐 byte 相同：
@@ -49,12 +49,13 @@ python search.py "*ology research"                          # wildcard（比對�
 python search.py --spell correct infromation retreival      # 拼字修正
 ```
 
-**什麼時候才需要 WARC？** 只有在 index 重建過、要重新跑前處理時。前處理需要 WARC 才能取得精確的文件數 N 和 TREC-ID；沒有 WARC 也能跑，但 N 會改用最大的 docID（這份資料剛好兩者相同，都是 31,480），而且不會重新產生 `doc_ids.tsv`。
+**什麼時候才需要 WARC？** 只有要從頭重建 index 時（`python build.py all`，見「建置流程」）。單獨重跑前處理也可以不用 WARC，但 N 會改用最大的 docID（這份資料剛好兩者相同，都是 31,480），而且不會重新產生 `doc_ids.tsv` 和 `surface_vocab.tsv`。
 
 ## 檔案結構
 
 ```
-team27_hw2/
+<ID>_HW2/
+├── build.py                 建置腳本：從 WARC 建 index → 前處理 → 產生 results/ → 打包成 dist/<ID>_HW2.zip
 ├── hw1_indexer.py           HW1 原始程式，原封不動；HW2 import 它的 tokenizer / linguistic / Config / 格式解析
 ├── prep.py                  前處理的程式本體（命令列：python prep.py）
 ├── hw2_index_prep.ipynb     前處理的說明版：逐步呼叫 prep.py 的函式並寫出推導，產生的檔案和 prep.py 完全相同
@@ -88,7 +89,7 @@ team27_hw2/
     └── meta.json            前處理產出：N、log base、avgdl、champion / tier 設定、build 時的 Config、postings 大小
 ```
 
-`07.warc.gz` 不在壓縮檔裡。要重跑前處理時，把它放在和 `prep.py` 同一層。
+`07.warc.gz` 不在壓縮檔裡。要從頭重建時，把它放在和 `build.py` 同一層，或用 `--warc` 指定位置。`dist/`（打包的輸出）只會出現在建置用的工作目錄，不在壓縮檔裡。
 
 ## 環境建置
 
@@ -97,39 +98,64 @@ team27_hw2/
 建議用全新的虛擬環境，避免和其他專案的套件版本衝突：
 
 ```
-cd team27_hw2
+cd <ID>_HW2
 python -m venv .venv
 .venv\Scripts\activate              # Windows；Linux / macOS 改成 source .venv/bin/activate
 pip install -r requirements.txt     # lxml、nltk、tqdm，與 HW1 相同；BM25 和 tiered index 也沒有新增套件
 pip install notebook                # 只有要打開前處理 notebook 時才需要（或用 VS Code 的 Jupyter）
 ```
 
-確認環境正常：`python search.py Hong Kong business` 應該印出設定（stderr）和 10 行結果，第一行是 `16103	0.407`。
+確認環境正常：`python search.py Hong Kong business` 應該印出設定（stderr）和 10 行結果，第一行是 `16103	0.408`。
 
 - **不需要網路**：NLTK stopwords 已經放在 `nltk_data/`。HW1 的程式啟動時會嘗試下載 wordnet，離線時印出的 `[nltk_data] Error loading ...` 可以忽略（見「給助教」）。
-- **硬碟**：解壓後約 280 MB，大部分是 HW1 的 `postings.txt`（200 MB）。
+- **單獨執行 `hw1_indexer.py` 時要指定 NLTK 資料夾**：HW2 的模組會自動把 `nltk_data/` 加進 NLTK 的搜尋路徑，但 HW1 的程式不會，沒有下載過 stopwords 的電腦會在 import 時失敗。`build.py` 呼叫它時會自動設定；手動執行時請用 `NLTK_DATA=nltk_data python hw1_indexer.py ...`（Windows：先 `set NLTK_DATA=nltk_data`）。
+- **硬碟**：解壓後約 290 MB，大部分是 HW1 的 `postings.txt`（200 MB）。
 - **記憶體**：查詢時約 300 – 500 MB（字典、統計量、第一次用到時載入的 champion / tier / 原始字形表）。
+
+## 建置流程（build.py）
+
+`output/` 裡的檔案共約 290 MB，`postings.txt` 一個就有 200 MB，超過 GitHub 的單檔上限（100 MB）。所以 GitHub 上的 repo 只存 source code、`nltk_data/`、`results/`；`output/`、`dist/`、WARC、zip 都列在 `.gitignore`。交給助教的壓縮檔則由 `build.py` 從 WARC 重新產生，裡面包含完整的 `output/`，助教不需要 WARC。
+
+```
+python build.py all --id <學號>       # 建 index → 前處理 → 產生 results/ → 打包成 dist/<學號>_HW2.zip
+python build.py index prep            # 只跑指定的步驟，依序執行
+python build.py all --force           # 不管檔案新舊，全部重建
+python build.py clean                 # 刪除 output/ 和 dist/（results/ 會進 git，所以保留）
+```
+
+| 步驟 | 做的事 | 什麼時候會跳過 |
+|---|---|---|
+| `index` | `hw1_indexer.py -i 07.warc.gz -o output`（設定 `NLTK_DATA` 指向 `nltk_data/`），約 4.5 分鐘 | `postings.txt` 比 WARC 和 `hw1_indexer.py` 都新；找不到 WARC 但已有 index 時沿用 |
+| `prep` | `prep.py -i output --warc 07.warc.gz`，約 4.5 分鐘，最後會跑六項驗證 | 十二個輸出檔都在，而且 `meta.json` 比 `postings.txt` 和 `prep.py` 都新 |
+| `results` | 用 `queries.txt` 產生 `results/` 的五個檔案（見「給助教」的表），約 20 秒 | 不跳過 |
+| `package` | 把 source code、`nltk_data/`、`results/`、整個 `output/` 打包成 `dist/<ID>_HW2.zip`，壓縮檔裡的最上層資料夾也叫 `<ID>_HW2`，約 95 MB | 不跳過；`output/` 或 `results/` 缺檔時中止 |
+
+「是否跳過」和 Makefile 一樣，是比較檔案的修改時間；任何一步失敗就停止，後面的步驟不會執行。開發時在全新的資料夾（只有 git 裡的檔案）跑過兩次 `python build.py all`，兩次產生的 index、前處理檔案、五個結果檔都逐 byte 相同，所以結果可以穩定重現。
+
+**和 HW1 交出去的 index 的關係**：這份 index 是用 HW1 的 `hw1_indexer.py`（沒有修改）在 Linux 上從 `07.warc.gz` 重新建出的，和 HW1 當時在 Windows 上交出去的檔案不完全相同：term 數 346,789（HW1 交件版 345,701）、postings 數 8,976,349（8,956,202）。抽查前 300 份文件，有 11 份的 term 不同，差異集中在混合文字的亂碼 token（如 `ÎI4ÙÌ`）和少數 HTML 殘留，原因比較可能是兩台電腦上 lxml 的版本或行為不同。一般英文 query 的排序幾乎不受影響：投影片的 query 在兩份 index 上的前 10 名，只有排序後段偶爾換掉一兩份文件。投影片只要求「HW1 從 ClueWeb09 產生的 inverted index」，所以用同一支程式重建是允許的；好處是 index、`surface_vocab.tsv` 和結果檔全部出自同一次建置，彼此完全一致。
+
+README 裡的統計數字、範例輸出和效果量測，除非另外註明，都是在這份重建的 index 上得到的。
 
 ## 使用步驟
 
-**1. 準備 HW1 的 index。** 壓縮檔裡已經有了。如果要重建，指令是 `python hw1_indexer.py -i 07.warc.gz -o output`，約 5 分鐘。
+**1. 準備 index。** 壓縮檔裡已經有了。要從頭重建，用 `python build.py index`（見上一節），約 4.5 分鐘。
 
 **2. 前處理（壓縮檔裡已經做好；index 重建過才需要重跑）。** 兩種方式擇一，產生的檔案逐 byte 相同：
 
 ```
-python prep.py                                # 約 5 分鐘，含驗證；加 --no-surface 約 1 分鐘
+python prep.py                                # 約 4.5 分鐘，含驗證；加 --no-surface 約 1 分鐘
 ```
 
 或打開 `hw2_index_prep.ipynb` 後 Run All。正確的結果應該是：
 
 - `response records: 31,480`，最後一筆的 TREC-ID 是 `clueweb09-en0000-07-31479`
-- `N = 31,480 (source: warc)`、`avgdl = 565.54`
-- 每個 term 的 champion list 合計 1,823,089 個 docID（兩種 scheme 相同）
-- tiered index 每種 scheme 都是 tier 1 有 1,263,480 個 docID、tier 2 有 1,917,466 個
-- surface vocabulary 約 40 萬行，涵蓋 99.7% 以上的 index term（見「原始字形詞表」一節）
+- `346,789 terms, 8,976,349 postings`、`N = 31,480 (warc)`、`avgdl = 568.37`
+- 每個 term 的 champion list 合計 1,827,355 個 docID（兩種 scheme 相同）
+- tiered index 每種 scheme 都是 tier 1 有 1,266,386 個 docID、tier 2 有 1,921,362 個
+- surface vocabulary 402,109 行，涵蓋 100.00% 的 index term（見「原始字形詞表」一節）
 - 六項驗證都印出 `OK` / `verify: ...`
 
-`prep.py` 會掃 WARC 兩次、`postings.txt` 三次，每一步都印出 `[n/7]` 和耗時。選項：
+`build.py prep` 就是執行這一步。`prep.py` 會掃 WARC 兩次、`postings.txt` 三次，每一步都印出 `[n/7]` 和耗時。選項：
 
 | 選項 | 說明 |
 |---|---|
@@ -142,7 +168,7 @@ python prep.py                                # 約 5 分鐘，含驗證；加 -
 | `--no-surface` | 不重建 `surface_vocab.tsv`（沿用既有的檔案），省下約 4 分鐘 |
 | `--no-verify` | 跳過驗證 |
 
-**只要 HW1 的 index 重建過，就必須重跑這一步**：`index_reader` 啟動時會比對 postings 的檔案大小和 `meta.json` 的紀錄，對不上就拒絕執行，避免拿舊的 offset 去 seek。
+**只要 index 重建過，就必須重跑這一步**（`build.py` 會自動判斷）：`index_reader` 啟動時會比對 postings 的檔案大小和 `meta.json` 的紀錄，對不上就拒絕執行，避免拿舊的 offset 去 seek。
 
 **3. 查詢。**
 
@@ -157,7 +183,7 @@ python search.py -f queries.txt -o run.txt     # batch：一行一個 query，�
 輸出格式和投影片第 5 頁一樣：
 
 ```
-16103	0.407
+16103	0.408
 16101	0.404
 16097	0.276
 ```
@@ -250,10 +276,10 @@ HW1 少了這些 HW2 需要的東西：trie 的 byte offset 只存在 build 時�
 
 - 分數相同時 docID 小的優先，所以每次產生的檔案都一樣。
 - df ≤ r 的 term 直接保留全部文件。每個 term 都有一行，行的順序和 `dictionary.txt` 相同；每行的 docID 由小到大排列。
-- `ranker.py` 載入時只把每行存成字串，查詢用到某個 term 時才解析它的 docID，避免每次啟動都要解析 182 萬個 ID。
+- `ranker.py` 載入時只把每行存成字串，查詢用到某個 term 時才解析它的 docID，避免每次啟動都要解析 183 萬個 ID。
 - **Fallback**：Boolean、phrase、proximity 的 filter 和 champion list 取交集後，常常剩不到 k 份文件（例如 `open source AND Linux` 只剩 2 份）。這時 ranker 會依課本的建議，改用完整的 candidate 重新排序；`-v` 會印出 `champion lists gave fewer than k documents`。
 
-效果（開發時量測，free text query，top-10）：10 個 query 中有 9 個的 top-10 和精確結果完全相同，另一個是 9/10；每個 query 的計算時間約減少 30%。時間沒有減少更多，是因為 postings 仍然要從硬碟讀出來，才知道 champion 文件的 tf；champion list 省下的是計分和 top-k 選取的部分。
+效果（free text query，top-10）：7 個投影片風格的 query，top-10 都和精確結果完全相同。每個 query 的時間約減少 20%（約 19 ms → 15 ms，TF-IDF）。時間沒有減少更多，是因為 postings 仍然要從硬碟讀出來，才知道 champion 文件的 tf；champion list 省下的是計分和 top-k 選取的部分。
 
 ### Tiered index
 
@@ -289,7 +315,7 @@ HW1 少了這些 HW2 需要的東西：trie 的 byte offset 只存在 build 時�
 
 BM25 在常見詞組成的 query 上表現較差，是因為 BM25 的 tf 部分在 tf 稍大之後就飽和，很多文件的排序分數幾乎一樣，前 20 名不一定是加總後最好的。把 k 調大（例如 `-k 50`）時，會更常用到 tier 2。
 
-速度：和 champion list 一樣，postings 仍然要整條讀出來才能知道候選文件的 tf，所以在這份資料上每個 query 的時間和精確排序差不多（約 12 – 17 ms）。省下的是計分的文件數：投影片的 query 平均從約 5,000 份降到約 40 份。
+速度：和 champion list 一樣，postings 仍然要整條讀出來才能知道候選文件的 tf，所以在這份資料上每個 query 的時間和精確排序差不多（約 15 – 22 ms，量測誤差內）。省下的是計分的文件數：投影片的 query 平均從約 5,000 份降到約 40 份。
 
 ### BM25
 
@@ -318,13 +344,13 @@ index 存的是 stem 之後的 term，原本的字形已經不見了：`running`
 
 - 依 surface 的 code point 排序，一個 surface 一行。同樣開頭的字形是連續的一段，可以用 bisect 找。
 - stopword 不會進 index，所以也不在表裡。
-- **只保留 index 裡存在的 term。** 用目前的 `hw1_indexer.py` 在 Linux 上重新解析 WARC，結果和交出去的 HW1 index 並不完全相同：抽查前 300 份文件，有 11 份不同，差異集中在混合文字的亂碼 token（如 `ÎI4ÙÌ`）和少數 HTML 殘留。換成 Python 3.14 結果也一樣，所以原因比較可能是建 index 時的 HW1 程式版本，或 Windows 和 Linux 上 lxml 的差異。這會多出 1,968 組 index 裡沒有的 term，留著沒有用，所以會被丟掉。
-- 目前這份詞表有 400,141 行，涵蓋 99.75% 的 index term、99.97% 的 token 出現次數。在建 index 的那台 Windows 電腦上重跑 `python prep.py`，涵蓋率應該會更接近 100%，驗證時會印出實際數字。
+- **只保留 index 裡存在的 term。** 解析 WARC 的程式和建 index 時相同，所以正常情況下每個 term 都在 index 裡。若 index 是在另一台電腦、或用不同版本的程式建的，兩次解析可能不完全一致（例如 HW1 交件版的 index 就有 1,968 組對不上），這時多出來的 term 會被丟掉。
+- 目前這份詞表有 402,109 行，丟掉 0 組，涵蓋 100.00% 的 index term 和 token 出現次數。改用 HW1 交件版的 index 時是 400,141 行、99.75%。
 - 驗證（`verify_surface_vocab`）逐行檢查：surface 嚴格遞增、term 都在 index 裡、HW1 的 `linguistic` 處理這個 token 後剛好得到這個 term、$0 < df \le cf$。
 
 ### spell.py：wildcard 比對原始字形、拼字修正
 
-**Wildcard。** `Matcher.expand_wildcard` 會把 pattern 同時套在 index term 和原始字形上，取兩邊得到的 term 的聯集。`comput*` 的結果和以前相同，`*ing` 則會找到 `running` → `run` 等 8,281 個 term。查詢方式：
+**Wildcard。** `Matcher.expand_wildcard` 會把 pattern 同時套在 index term 和原始字形上，取兩邊得到的 term 的聯集。`comput*` 的結果和以前相同，`*ing` 則會找到 `running` → `run` 等 8,290 個 term。查詢方式：
 
 - pattern 開頭的固定字串比結尾長（`comput*`、`c*t*r`）：在排序好的字形表上用 bisect 取出連續的一段，再用 regex 篩。
 - 結尾的固定字串比較長（`*ing`、`*ology`）：在「每個字形反過來拼」的排序表上做同樣的事，也就是課本的 reverse B-tree。這張表第一次用到時才建立。
@@ -517,7 +543,7 @@ python ranker.py 'your query'          # top 5 及分數
 python prep.py                         # 前處理，最後會跑驗證
 ```
 
-開發時在沙盒裡做過以下交叉驗證，對照組都是另外寫、演算法不同的暴力版本：
+開發時在沙盒裡做過以下交叉驗證，對照組都是另外寫、演算法不同的暴力版本。matcher、ranker、spell / wildcard 的項目是在 HW1 交件版的 index 上做的（這些模組之後沒有修改）；BM25、tiered index、prep 的項目在重建的 index 上重新跑過一次，結果相同：
 
 - matcher：18 個指定 query 加 1,500 組隨機 term 組合，結果和用 Python set 實作的 naive evaluator 完全一致。wildcard 展開和 `fnmatch` 掃整個字典的結果相同。
 - ranker：14 個 query 的每份 candidate，分數和直接套公式的結果誤差 < 1e-16，排序相同，分數都落在 [0, 1]。
@@ -544,8 +570,8 @@ python prep.py                         # 前處理，最後會跑驗證
 
 ## 已知限制
 
-- **原始字形詞表無法和 HW1 index 完全一致**（見「原始字形詞表」一節），約 0.25% 的 index term 沒有對應的字形；這些 term 仍然可以用 stem 的 wildcard 找到。
-- **很寬的 wildcard 在 Boolean 模式下很慢。** 例如 `*ing AND linux`：`*ing` 會展開成 8,281 個 term，Boolean 模式必須讀完它們全部的 postings，約需 8 秒。free text 模式只用 df 最高的 30 個來計分，不受影響。
+- **index 和 HW1 交件版不完全相同**：見「建置流程」一節。用 HW1 交件版的 index 也能執行（重跑 `prep.py` 即可），但原始字形詞表會有約 0.25% 的 index term 沒有對應的字形，這些 term 仍然可以用 stem 的 wildcard 找到。
+- **很寬的 wildcard 在 Boolean 模式下很慢。** 例如 `*ing AND linux`：`*ing` 會展開成 8,290 個 term，Boolean 模式必須讀完它們全部的 postings，約需 10 秒。free text 模式只用 df 最高的 30 個來計分，不受影響。
 - **拼字修正無法處理 collection 本身常見的錯字。** 網頁上 `teh`、`recieve`、`definately` 都出現數十次以上，會被視為正確的字。門檻（50 次、50 倍）是在「常見錯字」和「真實但少見的字」（`tcp` 74 次，旁邊有出現 1 萬多次的 `top`）之間取捨的結果。
 - **Soundex 很粗略。** 它只看子音的類別，`fonetik` → `phonetic` 這類修正大多做不到，所以 `--phonetic` 只是在距離相同時偏好發音相近的字，不會取代 edit distance。
 - **只支援 HW1 的單行 postings 格式**（`multiline=False`，也就是交件時的設定）。
