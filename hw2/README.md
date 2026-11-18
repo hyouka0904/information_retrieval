@@ -491,9 +491,9 @@ notebook 依序呼叫的就是這些函式；`run()` 是 `python prep.py` 的完
 | `write_tables(...)` / `build_meta(...)` / `write_meta(...)` | 寫出表格檔與 `meta.json`（一律 LF 換行） |
 | `verify_dictionary` / `verify_seeks` / `verify_doc_stats` / `verify_champions` / `verify_surface_vocab` | 各項驗證，失敗時丟出 `AssertionError` |
 
-## 鄧存正新增的部分
+## bonus的部分
 
-以下各節是在陳長壻的程式之上加的功能。**所有新選項都關閉時，執行的路徑和計算式與原本相同，`queries.txt` 的三份結果（`results.txt`、`results_champions.txt`、`results_spell_correct.txt`）逐 byte 不變。**
+**所有新選項都關閉時，執行的路徑和計算式與原本相同，`queries.txt` 的三份結果（`results.txt`、`results_champions.txt`、`results_spell_correct.txt`）逐 byte 不變。**
 
 ### Weighting schemes（Ch.6，`weighting.py`）
 
