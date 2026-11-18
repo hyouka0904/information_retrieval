@@ -1,79 +1,89 @@
 # IR HW2：Query Processing and Searching
 
-接續 HW1 的 positional inverted index，對使用者的 query 回傳依 TF-IDF + cosine similarity 排序的結果（投影片第 4、5 頁）。另外實作 BM25、champion lists、tiered index、phrase / proximity / wildcard / 複雜 Boolean、拼字與發音修正等加分項（完整列表見「加分項完成狀況」）。index 由 HW1 原封不動的 `hw1_indexer.py` 從 WARC 建出，前處理（`prep.py` 或 `hw2_index_prep.ipynb`）再補上 HW2 需要的統計量；之後的查詢都是讀這些小檔案，postings 則依 byte offset 從硬碟隨讀隨用。整條流程（建 index → 前處理 → 產生結果 → 打包）由 `build.py` 一個指令完成，見「建置流程（build.py）」。
+> 一頁的說明文件是 `README.pdf`。這份是完整的技術說明。
+
+接續 HW1 的 positional inverted index，對使用者的 query 回傳依 TF-IDF + cosine similarity 排序的結果（投影片第 4、5 頁）。index 由 HW1 原封不動的 `hw1_indexer.py` 從 WARC 建出，前處理（`prep.py` 或 `hw2_index_prep.ipynb`）再補上 HW2 需要的統計量；之後的查詢都是讀這些小檔案，postings 則依 byte offset 從硬碟隨讀隨用。整條流程（建 index → 前處理 → 加分項的檔案 → 壓縮 postings → 產生結果 → 打包）由 `build.py` 完成，見「建置流程（build.py）」。
 
 ## 組員
 
 | 姓名 | 學號 | 負責部分 |
 |---|---|---|
-| TODO | TODO | TODO |
-| TODO | TODO | TODO |
+| 陳長壻 | 115598095 | HW2 核心：前處理（`prep.py`、notebook）、`index_reader`、`query_parser`、`matcher`、`ranker`（ltc.ltc cosine）、`search` CLI；Bonus：複合查詢（phrase、proximity、wildcard、巢狀 Boolean、NOT）、拼字修正與 Soundex、index elimination、champion lists |
+| 鄧存正 | 115598063 | Bonus：weighting schemes（SMART 變體、BM25，`weighting.py`）、inexact top-k（impact ordering、tiered index、cluster pruning，`tf_index.py`、`clusters.py`）、k-gram wildcard index（`kgram.py`）；網頁 demo 與查詢詞標示（`ui.py`）；正確性驗證與效能量測（`evaluate.py`）；64 MB 封裝（`pack_index.py`）；文件 |
+
+下文中「鄧存正新增」的章節以外，都是陳長壻的實作與說明。
 
 ## 給助教：解壓後立即執行
 
 壓縮檔已經包含完整的 index 和所有前處理結果（`output/`），**不需要 WARC 檔，也不需要跑任何前處理**。
 
+上傳限制是 64 MB，而 `postings.txt`（200 MB）用 zip 壓完仍有 63 MB，所以壓縮檔裡放的是 `output/postings.delta.xz`（31 MB）。**第一次執行任何指令時，程式會自動把它還原成 `output/postings.txt`**（約 15 秒，會印出進度，並以檔案大小和 SHA-256 確認和打包前的 `postings.txt` 逐 byte 相同），之後就不會再做。細節見「封裝」一節。
+
 ```
 cd <ID>_HW2                          # 解壓後的資料夾，名稱和壓縮檔相同
 pip install -r requirements.txt
 python search.py                     # 出現 cmd> 後輸入 query，例如 Hong Kong business；exit 結束
+python ui.py                         # 或：網頁 demo，瀏覽器打開 http://localhost:8000（見「網頁 demo 與查詢詞標示」）
 ```
 
 - 需要 Python 3.8 以上。
 - 不需要網路。NLTK 的 stopwords 已經放在 `nltk_data/`，程式會自動使用。HW1 的程式啟動時仍會嘗試下載 wordnet 和 omw-1.4，離線時會印出幾行 `[nltk_data] Error loading ...`，這是正常的：這兩份資料只有 lemmatization 會用到，而這份 index 沒有開啟 lemmatization，查詢結果不受影響。
-- 第一次查詢約需 0.1 秒到數百毫秒（postings 還沒進入 OS 的 disk cache），之後每個 query 約 15 – 20 ms。
+- 第一次查詢約需 0.1 秒到數百毫秒（postings 還沒進入 OS 的 disk cache），之後每個 query 約 5 – 15 ms（依電腦而定）。
+- 第一次使用 `--impact`、`--tiered`、`--tf-index` 或 `--cluster` 時，會先從 `postings.txt` 建出 `tf_index.bin`（約 20 秒，只做一次）；第一次使用中間或多個 `*` 的 wildcard 時會建 `kgram.bin`（約 3 秒，只做一次）。這兩個檔可以從 postings 重建，為了壓在 64 MB 內沒有放進壓縮檔。想事先建好可以執行 `python prep_extra.py`。
 - 預設會檢查拼字：發現疑似拼錯的字時，只在 stderr 印出 `# did you mean: ...`，**排序結果仍然是原本輸入的 query 的結果**，所以不會影響評分。要讓程式自動修正後再搜尋，加上 `--spell correct`；完全關閉則用 `--spell off`。
 
-投影片要求的 ranked list 輸出在 `results/results.txt`，是用 `queries.txt`（投影片上的範例 query 加上幾個加分項的 query）跑出來的。`results/` 的每個檔案都可以用下表的指令重新產生，重跑後應該和壓縮檔裡的檔案逐 byte 相同：
+投影片要求的 ranked list 輸出在 `results/results.txt`，是用 `queries.txt`（投影片上的範例 query 加上幾個加分項的 query）跑出來的。`results/` 的每個檔案都可以用下表的指令重新產生，重跑後和壓縮檔裡的檔案逐 byte 相同（`python build.py results` 會一次全部重跑）：
 
-| 檔案 | 指令 | 內容 |
-|---|---|---|
-| `results/results.txt` | `python search.py -f queries.txt -o results/results.txt` | **必做**：TF-IDF + cosine 的精確排序 |
-| `results/results_bm25.txt` | `python search.py -f queries.txt -w bm25 -o results/results_bm25.txt` | 加分：BM25 |
-| `results/results_champions.txt` | `python search.py -f queries.txt --champions -o results/results_champions.txt` | 加分：champion lists |
-| `results/results_tiered.txt` | `python search.py -f queries.txt --tiered -o results/results_tiered.txt` | 加分：tiered index |
-| `results/results_spell_correct.txt` | `python search.py -f queries.txt --spell correct -o results/results_spell_correct.txt` | 加分：拼字修正後再搜尋 |
+| 檔案 | 指令 |
+|---|---|
+| `results.txt`（**必做**：TF-IDF + cosine） | `python search.py -f queries.txt -o results/results.txt` |
+| `results_champions.txt` | `python search.py -f queries.txt --champions -o results/results_champions.txt` |
+| `results_spell_correct.txt` | `python search.py -f queries.txt --spell correct -o results/results_spell_correct.txt` |
+| `results_tiered.txt` | `python search.py -f queries.txt --tiered -o results/results_tiered.txt` |
+| `results_impact.txt` | `python search.py -f queries.txt --impact -o results/results_impact.txt` |
+| `results_cluster_3,8.txt` | `python search.py -f queries.txt --cluster 3,8 -o "results/results_cluster_3,8.txt"` |
+| `results_scheme_<scheme>.txt` | `python search.py -f queries.txt --scheme <scheme> -o ...`（`lnc.ltc`、`anc.atc`、`bm25`） |
+| `results_bm25_impact.txt` | `python search.py -f queries.txt --scheme bm25 --impact -o results/results_bm25_impact.txt` |
+| `webtrack_ltc.txt` / `webtrack_bm25.txt` | `python search.py -f queries_webtrack.txt --trec-id [--scheme bm25] -o ...` |
+| `evaluation.md` | `python evaluate.py all`（約 2 分鐘；時間欄位依電腦而異） |
 
-**用自己的 query 評分**：一行一個 query 寫進文字檔（可以寫成 `qid:query`，`#` 開頭是註解），然後 `python search.py -f 你的檔案.txt -o 結果.txt`。每個 query 前面會有一行 `cmd> query`，接著是 `doc# <TAB> 分數`，預設前 10 筆（`-k 0` 為全部）。doc# 是 HW1 的 docID；要對 ClueWeb09 的 qrels，加上 `--trec-id`（第三欄印 TREC-ID）或 `--trec-run 名稱`（輸出 `trec_eval` 的 run 格式）。
+**用自己的 query 評分**：一行一個 query 寫進文字檔（可以寫成 `qid:query`，`#` 開頭是註解），然後 `python search.py -f 你的檔案.txt -o 結果.txt`。輸出是 `doc# <TAB> 分數`，預設前 10 筆（`-k 0` 為全部）；要對 ClueWeb09 的 qrels，加上 `--trec-id` 或 `--trec-run 名稱`。
 
-各加分功能的單一 query 範例：
-
-```
-python search.py -w bm25 Hong Kong business                 # BM25
-python search.py --tiered Hong Kong business                # tiered index（加 -v 會印出用了幾層）
-python search.py --champions Hong Kong business             # champion lists
-python search.py "\"Hong Kong\" business"                   # phrase（引號在 shell 裡要跳脫，建議用互動模式）
-python search.py "hong /3 kong"                             # proximity
-python search.py "(open OR free) AND software NOT microsoft" # 複雜 Boolean
-python search.py "*ology research"                          # wildcard（比對原始字形）
-python search.py --spell correct infromation retreival      # 拼字修正
-```
-
-**什麼時候才需要 WARC？** 只有要從頭重建 index 時（`python build.py all`，見「建置流程」）。單獨重跑前處理也可以不用 WARC，但 N 會改用最大的 docID（這份資料剛好兩者相同，都是 31,480），而且不會重新產生 `doc_ids.tsv` 和 `surface_vocab.tsv`。
+**什麼時候才需要 WARC？** 只有要從頭重建 index 時（`python build.py all`，見「建置流程」），以及 `ui.py` 要顯示標題和摘要時。
 
 ## 檔案結構
 
 ```
 <ID>_HW2/
-├── build.py                 建置腳本：從 WARC 建 index → 前處理 → 產生 results/ → 打包成 dist/<ID>_HW2.zip
+├── build.py                 建置腳本：WARC → index → 前處理 → 加分項檔案 → 壓縮 postings → results/ → dist/<ID>_HW2.zip
 ├── hw1_indexer.py           HW1 原始程式，原封不動；HW2 import 它的 tokenizer / linguistic / Config / 格式解析
 ├── prep.py                  前處理的程式本體（命令列：python prep.py）
 ├── hw2_index_prep.ipynb     前處理的說明版：逐步呼叫 prep.py 的函式並寫出推導，產生的檔案和 prep.py 完全相同
 ├── index_reader.py          index 的唯讀存取層
 ├── query_parser.py          query 字串 → AST
 ├── matcher.py               在 index 上執行 AST 的 filter → 符合條件的 docID
-├── ranker.py                TF-IDF + cosine / BM25 排序、top-k、inexact top-k（index elimination、champion lists、tiered index）
+├── ranker.py                TF-IDF + cosine 排序、top-k、inexact top-k 選項
 ├── search.py                命令列介面（互動 / 單一 query / batch）
+├── ui.py                    【鄧】網頁 demo（只用標準函式庫）：語法說明與範例、結果的詞頻表、標題與摘要
 ├── spell.py                 原始字形詞表（wildcard 用）、拼字修正、Soundex
+├── weighting.py             【鄧】weighting schemes：SMART ddd.qqq 與 BM25
+├── tf_index.py              【鄧】依 tf 分組的 postings（impact order），--impact / --tiered 共用
+├── clusters.py              【鄧】cluster pruning：leader / follower 的建立與查詢
+├── kgram.py                 【鄧】3-gram index，一般形式的 wildcard 用
+├── prep_extra.py            【鄧】第二段前處理：tf_index、doc_stats、clusters、kgram（不需要 WARC）
+├── pack_index.py            【鄧】postings.txt ⇄ postings.delta.xz（64 MB 上傳限制）
+├── evaluate.py              【鄧】和暴力版比對正確性、量測各 inexact 方法的時間與 overlap
 ├── queries.txt              產生 results/ 用的 query
+├── queries_webtrack.txt     TREC Web Track 2009–2012 的 200 個 topic（ClueWeb09 的公開 query）
 ├── requirements.txt
 ├── nltk_data/               NLTK stopwords，讓程式離線也能執行
 ├── results/
-│   ├── results.txt          queries.txt 的排序結果（投影片第 5 頁的格式，TF-IDF + cosine）
-│   ├── results_bm25.txt     同上，-w bm25
+│   ├── results.txt          queries.txt 的排序結果（投影片第 5 頁的格式）
 │   ├── results_champions.txt  同上，開啟 --champions
-│   ├── results_tiered.txt   同上，開啟 --tiered
-│   └── results_spell_correct.txt  同上，開啟 --spell correct
+│   ├── results_spell_correct.txt  同上，開啟 --spell correct
+│   ├── results_<選項>.txt   【鄧】同上，各 weighting scheme 與 inexact 方法（檔名即選項）
+│   ├── webtrack_ltc.txt / webtrack_bm25.txt  【鄧】200 個 Web Track topic 的 top-10（含 TREC-ID）
+│   └── evaluation.md        【鄧】evaluate.py 的輸出：正確性比對與效能量測
 └── output/
     ├── dictionary.txt       HW1 產出：term, df
     ├── postings.txt         HW1 產出：term, df: <doc, tf: <pos, ...>; ...>
@@ -83,67 +93,74 @@ python search.py --spell correct infromation retreival      # 拼字修正
     ├── doc_ids.tsv          前處理產出：doc_id \t trec_id \t url
     ├── champions.tsv        前處理產出：term \t doc doc ...（依 cosine 排序的 champion list）
     ├── champions_bm25.tsv   前處理產出：term \t doc doc ...（依 BM25 排序的 champion list）
-    ├── tiers.tsv            前處理產出：term \t tier1 docs \t tier2 docs（依 cosine 排序的 tiered index）
-    ├── tiers_bm25.tsv       前處理產出：同上，依 BM25 排序
     ├── surface_vocab.tsv    前處理產出：surface \t term \t cf \t df（原始字形 → index term）
-    └── meta.json            前處理產出：N、log base、avgdl、champion / tier 設定、build 時的 Config、postings 大小
+    ├── meta.json            前處理產出：N、log base、avgdl、champion 設定、build 時的 Config、postings 大小
+    ├── postings.delta.xz    【鄧】postings.txt 的壓縮形式（壓縮檔裡只有它，第一次執行時還原）
+    ├── postings.pack.json   【鄧】還原後應有的大小與 SHA-256
+    ├── doc_stats.tsv        【鄧】每份文件的 |d|、相異 term 數、max tf，以及 15 種 tf×idf 組合的向量長度
+    ├── cluster_leaders.tsv  【鄧】177 個 leader 的單位向量
+    ├── cluster_followers.tsv【鄧】每份文件最近的 3 個 leader
+    ├── clusters.json        【鄧】cluster pruning 的設定
+    ├── tf_index.bin/.dir/.json  【鄧】依 tf 分組的 postings；不在壓縮檔內，第一次用到時建立
+    ├── kgram.bin/.json      【鄧】3-gram index；不在壓縮檔內，第一次用到時建立
+    └── doc_text.tsv         【鄧】ui.py 的標題 / 摘要快取（title \t 前 2 萬字內文，第 n 行 = doc n）；需要 WARC，不在壓縮檔內
 ```
 
 `07.warc.gz` 不在壓縮檔裡。要從頭重建時，把它放在和 `build.py` 同一層，或用 `--warc` 指定位置。`dist/`（打包的輸出）只會出現在建置用的工作目錄，不在壓縮檔裡。
 
 ## 環境建置
 
-需要 Python 3.8 以上。HW1 在 Windows 11 + Python 3.14.7 上測過，HW2 在 Linux + Python 3.12.3 與 3.13 上測過。
+需要 Python 3.8 以上。HW1 在 Windows 11 + Python 3.14.7 上測過，HW2 在 Linux + Python 3.12.3 / 3.13 和 Windows 11 + Python 3.14.7 上都測過。
 
-建議用全新的虛擬環境，避免和其他專案的套件版本衝突：
+建議用全新的虛擬環境：
 
 ```
 cd <ID>_HW2
 python -m venv .venv
 .venv\Scripts\activate              # Windows；Linux / macOS 改成 source .venv/bin/activate
-pip install -r requirements.txt     # lxml、nltk、tqdm，與 HW1 相同；BM25 和 tiered index 也沒有新增套件
+pip install -r requirements.txt     # lxml、nltk、tqdm，與 HW1 相同，HW2 沒有新增套件
 pip install notebook                # 只有要打開前處理 notebook 時才需要（或用 VS Code 的 Jupyter）
 ```
 
 確認環境正常：`python search.py Hong Kong business` 應該印出設定（stderr）和 10 行結果，第一行是 `16103	0.408`。
 
-- **不需要網路**：NLTK stopwords 已經放在 `nltk_data/`。HW1 的程式啟動時會嘗試下載 wordnet，離線時印出的 `[nltk_data] Error loading ...` 可以忽略（見「給助教」）。
 - **單獨執行 `hw1_indexer.py` 時要指定 NLTK 資料夾**：HW2 的模組會自動把 `nltk_data/` 加進 NLTK 的搜尋路徑，但 HW1 的程式不會，沒有下載過 stopwords 的電腦會在 import 時失敗。`build.py` 呼叫它時會自動設定；手動執行時請用 `NLTK_DATA=nltk_data python hw1_indexer.py ...`（Windows：先 `set NLTK_DATA=nltk_data`）。
-- **硬碟**：解壓後約 290 MB，大部分是 HW1 的 `postings.txt`（200 MB）。
-- **記憶體**：查詢時約 300 – 500 MB（字典、統計量、第一次用到時載入的 champion / tier / 原始字形表）。
 
 ## 建置流程（build.py）
 
-`output/` 裡的檔案共約 290 MB，`postings.txt` 一個就有 200 MB，超過 GitHub 的單檔上限（100 MB）。所以 GitHub 上的 repo 只存 source code、`nltk_data/`、`results/`；`output/`、`dist/`、WARC、zip 都列在 `.gitignore`。交給助教的壓縮檔則由 `build.py` 從 WARC 重新產生，裡面包含完整的 `output/`，助教不需要 WARC。
+GitHub 上的 repo 只存 source code、`nltk_data/`、`results/`；`output/`（約 290 MB，`postings.txt` 一個就 200 MB，超過 GitHub 的單檔上限）、`dist/`、WARC、zip 都列在 `.gitignore`。交件的壓縮檔由 `build.py` 從 WARC 重新產生，助教拿到的壓縮檔裡已經有完整的前處理結果，不需要 WARC。
 
 ```
-python build.py all --id <學號>       # 建 index → 前處理 → 產生 results/ → 打包成 dist/<學號>_HW2.zip
-python build.py index prep            # 只跑指定的步驟，依序執行
-python build.py all --force           # 不管檔案新舊，全部重建
-python build.py clean                 # 刪除 output/ 和 dist/（results/ 會進 git，所以保留）
+python build.py all --id <學號>       # index → prep → extra → pack → results → package，產生 dist/<學號>_HW2.zip
+python build.py clean all --id <學號> # 從零開始（換過 index 來源，或 output/ 裡是別的 index 時用這個）
+python build.py results evaluate      # 只重跑 results/ 和 evaluation.md
 ```
 
 | 步驟 | 做的事 | 什麼時候會跳過 |
 |---|---|---|
-| `index` | `hw1_indexer.py -i 07.warc.gz -o output`（設定 `NLTK_DATA` 指向 `nltk_data/`），約 4.5 分鐘 | `postings.txt` 比 WARC 和 `hw1_indexer.py` 都新；找不到 WARC 但已有 index 時沿用 |
-| `prep` | `prep.py -i output --warc 07.warc.gz`，約 4.5 分鐘，最後會跑六項驗證 | 十二個輸出檔都在，而且 `meta.json` 比 `postings.txt` 和 `prep.py` 都新 |
-| `results` | 用 `queries.txt` 產生 `results/` 的五個檔案（見「給助教」的表），約 20 秒 | 不跳過 |
-| `package` | 把 source code、`nltk_data/`、`results/`、整個 `output/` 打包成 `dist/<ID>_HW2.zip`，壓縮檔裡的最上層資料夾也叫 `<ID>_HW2`，約 95 MB | 不跳過；`output/` 或 `results/` 缺檔時中止 |
+| `index` | `hw1_indexer.py -i 07.warc.gz -o output`（自動設定 `NLTK_DATA`），約 3.5 分鐘 | `postings.txt`、`dictionary.txt` 比 WARC 和 `hw1_indexer.py` 都新；找不到 WARC 但已有 index 時沿用 |
+| `prep` | `prep.py -i output --warc 07.warc.gz`，約 3.5 分鐘，最後跑五項驗證 | 八個輸出檔都比 `postings.txt` 和 `prep.py` 新 |
+| `extra` | `prep_extra.py --force`（tf index、`doc_stats.tsv`、cluster、k-gram），約 40 秒 | 輸出都比 `meta.json` 和 `prep_extra.py` 新 |
+| `pack` | `pack_index.py pack`，約 2.5 分鐘（含一次還原驗證） | `postings.pack.json` 記的大小和 SHA-256 和目前的 `postings.txt` 相同 |
+| `results` | 重新產生 `results/` 的 12 個結果檔（上表），約 20 秒 | 不跳過 |
+| `evaluate` | `evaluate.py all` → `results/evaluation.md`，約 2 分鐘；**不在 `all` 裡** | 不跳過 |
+| `package` | 打包成 `dist/<ID>_HW2.zip`，最上層資料夾也叫 `<ID>_HW2`；不放 `postings.txt`（放壓縮版）和第一次使用時會自動重建的 `tf_index.*`、`kgram.*`、`doc_text.tsv` | 不跳過；缺檔、或 `postings.delta.xz` 和 `postings.txt` 對不上時中止；超過 64 MB 時警告 |
 
-「是否跳過」和 Makefile 一樣，是比較檔案的修改時間；任何一步失敗就停止，後面的步驟不會執行。開發時在全新的資料夾（只有 git 裡的檔案）跑過兩次 `python build.py all`，兩次產生的 index、前處理檔案、五個結果檔都逐 byte 相同，所以結果可以穩定重現。
+- 「是否跳過」和 Makefile 一樣比較檔案的修改時間；任何一步失敗就停止。
+- `extra` 一律加 `--force`：`prep_extra.py` 單獨執行時只要 `doc_stats.tsv` 存在就不重建，index 換過後會留下舊的檔案。
+- `package` 會再確認一次壓縮的 postings 屬於目前的 index。最容易出錯的情況是重建 index 後忘了重新 pack：本機有 `postings.txt` 所以一切正常，但壓縮檔裡會是舊的 `postings.delta.xz` 配上新的 `offsets.tsv`，助教那邊還原出舊的 postings、SHA-256 也會通過，查詢結果卻全錯。
+- 開發時在只有 git 內容的全新資料夾執行 `python build.py all`（約 11 分鐘），再把產生的壓縮檔解到另一個資料夾、用全新的 venv 只裝 `requirements.txt` 執行：自動還原 `postings.txt`、自動建立 tf index 後，`results.txt`、`results_impact.txt`、`results_scheme_bm25.txt` 和打包前逐 byte 相同。
 
-**和 HW1 交出去的 index 的關係**：這份 index 是用 HW1 的 `hw1_indexer.py`（沒有修改）在 Linux 上從 `07.warc.gz` 重新建出的，和 HW1 當時在 Windows 上交出去的檔案不完全相同：term 數 346,789（HW1 交件版 345,701）、postings 數 8,976,349（8,956,202）。抽查前 300 份文件，有 11 份的 term 不同，差異集中在混合文字的亂碼 token（如 `ÎI4ÙÌ`）和少數 HTML 殘留，原因比較可能是兩台電腦上 lxml 的版本或行為不同。一般英文 query 的排序幾乎不受影響：投影片的 query 在兩份 index 上的前 10 名，只有排序後段偶爾換掉一兩份文件。投影片只要求「HW1 從 ClueWeb09 產生的 inverted index」，所以用同一支程式重建是允許的；好處是 index、`surface_vocab.tsv` 和結果檔全部出自同一次建置，彼此完全一致。
-
-README 裡的統計數字、範例輸出和效果量測，除非另外註明，都是在這份重建的 index 上得到的。
+**和 HW1 交出去的 index 的關係**：這份 index 是用 HW1 的 `hw1_indexer.py`（沒有修改）在 Linux 上從 `07.warc.gz` 重新建出的，和 HW1 當時在 Windows 上交出去的檔案不完全相同：term 數 346,789（HW1 交件版 345,701）、postings 數 8,976,349（8,956,202）。抽查前 300 份文件，有 11 份的 term 不同，差異集中在混合文字的亂碼 token（如 `ÎI4ÙÌ`）和少數 HTML 殘留；在 Windows 上重新解析則和 HW1 交件版一致，所以原因是兩個平台上 lxml 的行為不同。一般英文 query 的排序幾乎不受影響：`queries.txt` 的 10 個 query 在兩份 index 上的 top-10，`results.txt` 只有 1 個位置換了文件。投影片只要求「HW1 從 ClueWeb09 產生的 inverted index」，所以用同一支程式重建是允許的；好處是 index、`surface_vocab.tsv` 和結果檔全部出自同一次建置。README 裡的統計數字、範例輸出和效果量測，除非另外註明，都是在這份重建的 index 上得到的。
 
 ## 使用步驟
 
-**1. 準備 index。** 壓縮檔裡已經有了。要從頭重建，用 `python build.py index`（見上一節），約 4.5 分鐘。
+**1. 準備 index。** 壓縮檔裡已經有了（`postings.txt` 是壓縮版，第一次執行時自動還原）。要從頭重建，用 `python build.py index`（見上一節），約 3.5 分鐘。
 
 **2. 前處理（壓縮檔裡已經做好；index 重建過才需要重跑）。** 兩種方式擇一，產生的檔案逐 byte 相同：
 
 ```
-python prep.py                                # 約 4.5 分鐘，含驗證；加 --no-surface 約 1 分鐘
+python prep.py                                # 約 3.5 分鐘，含驗證；加 --no-surface 約 1 分鐘
 ```
 
 或打開 `hw2_index_prep.ipynb` 後 Run All。正確的結果應該是：
@@ -151,11 +168,10 @@ python prep.py                                # 約 4.5 分鐘，含驗證；加
 - `response records: 31,480`，最後一筆的 TREC-ID 是 `clueweb09-en0000-07-31479`
 - `346,789 terms, 8,976,349 postings`、`N = 31,480 (warc)`、`avgdl = 568.37`
 - 每個 term 的 champion list 合計 1,827,355 個 docID（兩種 scheme 相同）
-- tiered index 每種 scheme 都是 tier 1 有 1,266,386 個 docID、tier 2 有 1,921,362 個
 - surface vocabulary 402,109 行，涵蓋 100.00% 的 index term（見「原始字形詞表」一節）
-- 六項驗證都印出 `OK` / `verify: ...`
+- 四項驗證都印出 `OK` / `verify: ...`
 
-`build.py prep` 就是執行這一步。`prep.py` 會掃 WARC 兩次、`postings.txt` 三次，每一步都印出 `[n/7]` 和耗時。選項：
+`prep.py` 的選項：
 
 | 選項 | 說明 |
 |---|---|
@@ -163,8 +179,7 @@ python prep.py                                # 約 4.5 分鐘，含驗證；加
 | `--warc PATH` / `--no-warc` | WARC 的位置；或不讀 WARC |
 | `--champion-schemes ...` | 要產生哪些 champion list：`cosine`、`bm25`，預設兩個都產生；沒選到的舊檔會被刪除 |
 | `--champion-r R` | 每個 term 保留幾份文件，預設 50 |
-| `--bm25-k1 K1` / `--bm25-b B` | 排序 `champions_bm25.tsv`、`tiers_bm25.tsv` 用的 BM25 參數，預設 1.2 / 0.75；也是 `search.py -w bm25` 的預設參數 |
-| `--tier-sizes S1 S2 ...` | tiered index 每層的名次邊界，預設 `20 200`（tier 1 = 前 20 名、tier 2 = 第 21–200 名、其餘是最後一層）；不給數字代表不建。和 champion list 用同一組 `--champion-schemes` |
+| `--bm25-k1 K1` / `--bm25-b B` | 排序 `champions_bm25.tsv` 用的 BM25 參數，預設 1.2 / 0.75 |
 | `--no-surface` | 不重建 `surface_vocab.tsv`（沿用既有的檔案），省下約 4 分鐘 |
 | `--no-verify` | 跳過驗證 |
 
@@ -197,10 +212,13 @@ python search.py -f queries.txt -o run.txt     # batch：一行一個 query，�
 | `--digits N` | 分數的小數位數，預設 3 |
 | `--idf-threshold X` | index elimination：idf 低於 X 的 query term 不參與計算 |
 | `--min-match M` | index elimination（只作用在 free text）：文件至少要含 M 個 query term |
-| `-w`、`--weighting {tfidf,bm25}` | 計分方式：`tfidf`（預設，投影片的 TF-IDF + cosine）或 `bm25` |
-| `--bm25-k1 K1` / `--bm25-b B` | BM25 參數；預設取 `meta.json` 裡建 champion list 時的值（1.2 / 0.75） |
-| `--champions` | 只計算 champion list 聯集內的文件（TF-IDF 讀 `champions.tsv`，BM25 讀 `champions_bm25.tsv`） |
-| `--tiered` | tiered index：先只算最高一層，不足 k 筆再往下一層（TF-IDF 讀 `tiers.tsv`，BM25 讀 `tiers_bm25.tsv`）；不能和 `--champions` 同時使用 |
+| `--champions` | 只計算 champion list 聯集內的文件（讀 `champions.tsv`；`--scheme bm25` 時讀 `champions_bm25.tsv`） |
+| `--scheme DDD.QQQ` | 【鄧】weighting scheme，SMART 記法（文件.查詢）或 `bm25`；預設 `ltc.ltc` 即投影片公式。見「Weighting schemes」 |
+| `--k1 X` / `--b X` | 【鄧】BM25 參數，預設 1.2 / 0.75 |
+| `--impact` | 【鄧】impact ordering：tf 由大到小的 postings + max-score 提早結束，top-k 和精確結果相同 |
+| `--tiered` | 【鄧】tiered index：先只看高 tf 的 tier，不足 k 份才往下一層 |
+| `--cluster B1,B2` | 【鄧】cluster pruning：每份文件跟隨最近的 B1 個 leader（≤ 3），查詢時只看離 query 最近的 B2 個 leader 的 follower |
+| `--tf-index` | 【鄧】精確排序，但 (doc, tf) 改從二進位的 `tf_index.bin` 讀，不解析 `postings.txt` |
 | `--wildcard-limit N` | wildcard 用來計分的展開詞上限，預設 30 |
 | `--spell MODE` | 拼字修正：`suggest`（預設，只提示，不改結果）、`correct`（修正後再搜尋）、`off` |
 | `--phonetic` | 拼字修正時也考慮發音相近（Soundex）的字 |
@@ -245,7 +263,7 @@ python search.py -f queries.txt -o run.txt     # batch：一行一個 query，�
 
 ### prep.py 與 hw2_index_prep.ipynb：補齊 HW1 的缺口
 
-**兩種形式的關係**：所有邏輯只寫在 `prep.py` 的函式裡。`python prep.py` 依序呼叫這些函式；notebook 一格一格呼叫同一批函式，並把推導寫在 markdown 裡。程式只有一份，所以兩邊不會不同步。開發時兩種方式都從頭跑過一次，十個輸出檔（含 `meta.json`）逐 byte 相同；加入 tiered index 後，原本的九個檔案也和加入前逐 byte 相同。
+**兩種形式的關係**：所有邏輯只寫在 `prep.py` 的函式裡。`python prep.py` 依序呼叫這些函式；notebook 一格一格呼叫同一批函式，並把推導寫在 markdown 裡。程式只有一份，所以兩邊不會不同步。開發時兩種方式都從頭跑過一次，七個輸出檔逐 byte 相同，也和改版前 notebook 產生的 `offsets.tsv`、`doc_norms.tsv`、`doc_ids.tsv` 相同。
 
 HW1 少了這些 HW2 需要的東西：trie 的 byte offset 只存在 build 時的記憶體裡、沒有把 N 存下來、沒有文件向量的長度（cosine 的分母）、沒有文件長度（BM25 用）。步驟如下：
 
@@ -257,11 +275,10 @@ HW1 少了這些 HW2 需要的東西：trie 的 byte offset 只存在 build 時�
 
    每份文件只累加三個和，等 N 確定後一次算出長度。avgdl $=\sum_d |d| / N$。
 4. **第二次掃 postings：champion lists**（見下一節）。
-5. **第三次掃 postings：tiered index**（見「Tiered index」一節）。
-6. **第二次掃 WARC：原始字形詞表**（見「原始字形詞表」一節）。這一步要重新解析每一頁的 HTML，約需 4 分鐘，是前處理最慢的部分。
-7. **寫 `meta.json`**：最後才寫，所以它描述的一定是旁邊這一批檔案。
+5. **第二次掃 WARC：原始字形詞表**（見「原始字形詞表」一節）。這一步要重新解析每一頁的 HTML，約需 4 分鐘，是前處理最慢的部分。
+6. **寫 `meta.json`**：最後才寫，所以它描述的一定是旁邊這一批檔案。
 
-驗證以 HW1 的檔案和直接套公式的暴力計算當作正確答案：offsets 和 `dictionary.txt` 逐行一致、隨機 seek 讀到正確的 record、展開式算出的 norm 和直接套公式的結果相同（相對誤差 < 1e-9）、文件長度和直接加總 tf 的結果完全相同、champion list 和 tiered index 都和完整排序的結果相同、原始字形詞表的格式和對應關係正確（見下文）。
+驗證以 HW1 的檔案和直接套公式的暴力計算當作正確答案：offsets 和 `dictionary.txt` 逐行一致、隨機 seek 讀到正確的 record、展開式算出的 norm 和直接套公式的結果相同（相對誤差 < 1e-9）、文件長度和直接加總 tf 的結果完全相同、champion list 和完整排序的結果相同、原始字形詞表的格式和對應關係正確（見下文）。
 
 ### Champion lists
 
@@ -271,65 +288,15 @@ HW1 少了這些 HW2 需要的東西：trie 的 byte offset 只存在 build 時�
 
 | 檔案 | 每份文件的排序分數 | 誰使用 |
 |---|---|---|
-| `champions.tsv` | $(1+\log tf)\,/\,\lVert d\rVert$ | `--champions`（TF-IDF） |
-| `champions_bm25.tsv` | $tf\,(k_1+1)\,/\,\big(tf + k_1(1-b+b\,\lvert d\rvert/\text{avgdl})\big)$ | `-w bm25 --champions`；建檔時的 $k_1$、$b$ 和查詢時不同會印出警告 |
+| `champions.tsv` | $(1+\log tf)\,/\,\lVert d\rVert$ | `ranker.py` 的 `--champions`（cosine） |
+| `champions_bm25.tsv` | $tf\,(k_1+1)\,/\,\big(tf + k_1(1-b+b\,\lvert d\rvert/\text{avgdl})\big)$ | `--scheme bm25` 的 `--champions` |
 
 - 分數相同時 docID 小的優先，所以每次產生的檔案都一樣。
 - df ≤ r 的 term 直接保留全部文件。每個 term 都有一行，行的順序和 `dictionary.txt` 相同；每行的 docID 由小到大排列。
 - `ranker.py` 載入時只把每行存成字串，查詢用到某個 term 時才解析它的 docID，避免每次啟動都要解析 183 萬個 ID。
 - **Fallback**：Boolean、phrase、proximity 的 filter 和 champion list 取交集後，常常剩不到 k 份文件（例如 `open source AND Linux` 只剩 2 份）。這時 ranker 會依課本的建議，改用完整的 candidate 重新排序；`-v` 會印出 `champion lists gave fewer than k documents`。
 
-效果（free text query，top-10）：7 個投影片風格的 query，top-10 都和精確結果完全相同。每個 query 的時間約減少 20%（約 19 ms → 15 ms，TF-IDF）。時間沒有減少更多，是因為 postings 仍然要從硬碟讀出來，才知道 champion 文件的 tf；champion list 省下的是計分和 top-k 選取的部分。
-
-### Tiered index
-
-課本 7.2.1 的 tiered index 是 champion list 的推廣：每個 term 的 postings 依「這個 term 對該文件的貢獻」分成好幾層，查詢時由上往下，湊滿 k 份就停。
-
-**分層**：排序分數和 champion list 相同（上一節的表），依名次切層，預設 `--tier-sizes 20 200`：
-
-| 層 | 內容 | 存放位置 |
-|---|---|---|
-| tier 1 | 每個 term 的前 20 名 | `tiers.tsv` 第 2 欄 |
-| tier 2 | 第 21 – 200 名 | `tiers.tsv` 第 3 欄 |
-| tier 3 | 其餘 | 不另外存，就是 postings 裡的其他文件 |
-
-每行格式是 `term \t tier1 docs \t tier2 docs`，每層的 docID 由小到大排列，行的順序和 `dictionary.txt` 相同。BM25 有自己的 `tiers_bm25.tsv`，依 BM25 的 tf 部分排序。
-
-**查詢**（`Ranker.rank(..., tiered=True)`）：
-
-1. 取所有 query term 的 tier 1 聯集，和 Boolean / phrase filter 取交集，對這些文件算**完整**的分數（用全部 query term，不只是 tier 裡的部分）。
-2. 符合條件的文件 ≥ k 份就輸出前 k 名；否則加入每個 term 的 tier 2 重算。
-3. 到了最後一層就是全部 postings，結果等於精確排序。所以 tiered index 一定會湊滿 k 份（只要真的有 k 份符合條件），不像 champion list 只能「全有或全無」地退回完整排序。
-
-`-v` 會印出 `tiers read: 2 of 3` 這樣的資訊。
-
-**為什麼不用課本例子的 tf 門檻**：我們先實作了「tf ≥ 10 一層、3 ≤ tf < 10 一層、其餘一層」的版本。結果和定義一致，但品質很差：tf 門檻偏好很長的文件，而 cosine 會除以 ‖d‖，真正排前面的常常是短文件。投影片的 free text query 中，tf 門檻版的前 10 名和精確結果平均只重疊 2.4 份；改成依正規化後的貢獻分層（也就是現在的作法），平均重疊 9.7 份。
-
-**效果**（開發時量測，top-10）：
-
-| 計分方式 | query 類型 | 和精確 top-10 的重疊 | 讀到第幾層 |
-|---|---|---|---|
-| TF-IDF | 7 個 free text | 6 個 10/10，1 個 8/10 | 都只用 tier 1 |
-| TF-IDF | 4 個 Boolean / phrase | 10、9、10、10 | tier 1 或 2 |
-| BM25 | 11 個 query | 9 個 8/10 以上；`United States government` 2/10、`software engineer OR project manager` 1/10 | tier 1 或 2 |
-
-BM25 在常見詞組成的 query 上表現較差，是因為 BM25 的 tf 部分在 tf 稍大之後就飽和，很多文件的排序分數幾乎一樣，前 20 名不一定是加總後最好的。把 k 調大（例如 `-k 50`）時，會更常用到 tier 2。
-
-速度：和 champion list 一樣，postings 仍然要整條讀出來才能知道候選文件的 tf，所以在這份資料上每個 query 的時間和精確排序差不多（約 15 – 22 ms，量測誤差內）。省下的是計分的文件數：投影片的 query 平均從約 5,000 份降到約 40 份。
-
-### BM25
-
-`-w bm25`（`Ranker(scheme="bm25")`）改用 Okapi BM25：
-
-$$\text{score}(q,d)=\sum_{t\in q} qtf_t\cdot\ln\!\Big(1+\frac{N-df_t+0.5}{df_t+0.5}\Big)\cdot\frac{tf_{t,d}\,(k_1+1)}{tf_{t,d}+k_1\big(1-b+b\cdot|d|/\text{avgdl}\big)}$$
-
-- **idf**：用 $\ln(1+\frac{N-df+0.5}{df+0.5})$（Lucene 的寫法）。原始的 Robertson–Spärck Jones 形式在 df > N/2 時會變成負數，這個寫法不會。
-- **query tf**：直接乘上去（相當於 $k_3\to\infty$），所以 query 裡重複的詞權重會加倍，和 TF-IDF 模式一樣會累計 query tf。
-- **$|d|$ 與 avgdl**：前處理的 `doc_lengths.tsv` 與 `meta.json`。$|d|$ 是 stopword 移除、stemming 之後留在 index 裡的 token 數。ranker 第一次用到 BM25 時，把每份文件的 $k_1(1-b+b|d|/\text{avgdl})$ 算好存成陣列。
-- **參數**：預設 $k_1=1.2$、$b=0.75$，可以用 `--bm25-k1`、`--bm25-b` 改。若和建 `champions_bm25.tsv` / `tiers_bm25.tsv` 時的參數不同，加上 `--champions` 或 `--tiered` 時會印出警告：檔案仍然可以用，只是挑出的文件和計分標準不完全一致。要完全一致就用同樣的參數重跑 `python prep.py --bm25-k1 X --bm25-b Y`。
-- 分數不在 [0, 1]，也不做任何長度正規化（BM25 的長度正規化已經在分母裡），輸出格式仍是 `doc# \t score`。
-- index elimination（`--idf-threshold`）仍然用 $\log_{10}(N/df)$ 判斷，所以同一個門檻在兩種計分方式下刪掉的是同一批 term。
-- Boolean / phrase filter、wildcard、拼字修正、champion lists、tiered index 都和 TF-IDF 模式共用同一套流程，只有計分公式不同。
+效果（開發時量測，free text query，top-10）：10 個 query 中有 9 個的 top-10 和精確結果完全相同，另一個是 9/10；每個 query 的計算時間約減少 30%。時間沒有減少更多，是因為 postings 仍然要從硬碟讀出來，才知道 champion 文件的 tf；champion list 省下的是計分和 top-k 選取的部分。
 
 ### 原始字形詞表（surface_vocab.tsv）
 
@@ -344,8 +311,8 @@ index 存的是 stem 之後的 term，原本的字形已經不見了：`running`
 
 - 依 surface 的 code point 排序，一個 surface 一行。同樣開頭的字形是連續的一段，可以用 bisect 找。
 - stopword 不會進 index，所以也不在表裡。
-- **只保留 index 裡存在的 term。** 解析 WARC 的程式和建 index 時相同，所以正常情況下每個 term 都在 index 裡。若 index 是在另一台電腦、或用不同版本的程式建的，兩次解析可能不完全一致（例如 HW1 交件版的 index 就有 1,968 組對不上），這時多出來的 term 會被丟掉。
-- 目前這份詞表有 402,109 行，丟掉 0 組，涵蓋 100.00% 的 index term 和 token 出現次數。改用 HW1 交件版的 index 時是 400,141 行、99.75%。
+- **只保留 index 裡存在的 term。** 解析 WARC 的程式和建 index 時相同，正常情況下每個 term 都在 index 裡。但 index 若是在另一個平台上建的，兩次解析可能不一致：在 Linux 上解析、對照 HW1 在 Windows 上交出的 index 時，會多出 1,968 組 index 裡沒有的 term，這些會被丟掉。
+- 目前這份詞表和 index 都是 `build.py` 在同一台電腦上產生的：402,109 行，丟掉 0 組，涵蓋 100.00% 的 index term 和 token 出現次數。（對照用：在 Linux 上對 HW1 交件版的 index 產生時是 400,141 行、99.75%；在建 HW1 index 的 Windows 電腦上則是 400,989 行、100.00%，這也證實差異來自兩個平台上 lxml 的行為。）
 - 驗證（`verify_surface_vocab`）逐行檢查：surface 嚴格遞增、term 都在 index 裡、HW1 的 `linguistic` 處理這個 token 後剛好得到這個 term、$0 < df \le cf$。
 
 ### spell.py：wildcard 比對原始字形、拼字修正
@@ -408,12 +375,12 @@ index 存的是 stem 之後的 term，原本的字形已經不見了：`running`
 
 ### ranker.py：排序
 
-預設（TF-IDF）query 端和 document 端用同樣的權重 $(1+\log tf)\cdot\log(N/df)$，分數為 $\sum_t w_{tq}w_{td}/(|q|\,|d|)$。BM25 的公式見「BM25」一節；兩者共用以下流程，只有累加的那一項和最後要不要除以長度不同。
+query 端和 document 端用同樣的權重 $(1+\log tf)\cdot\log(N/df)$，分數為 $\sum_t w_{tq}w_{td}/(|q|\,|d|)$。
 
 - **query term**：從 `positive_leaves` 收集，重複的詞會累計 query tf。wildcard 只取 df 最高的前 `wildcard_limit` 個展開詞。
 - **candidate**：有 filter 時就是 matcher 的結果；純 free text 時，含任一 query term 的文件都是 candidate。符合 filter 但分數為 0 的文件（如 `NOT microsoft`）仍會出現在結果裡，排在最後。
 - **計算**：term-at-a-time 累加，用 `heapq.nlargest` 取 top-k；同分時 docID 小的排前面。
-- **inexact top-k**：`idf_threshold`、`min_match`、`champions`、`tiered` 只縮小計算範圍。$|q|$ 一律用全部的 term 計算，所以開關這些選項不會改變分數的尺度。champion list 和 tiered index 都是把候選文件限制在某個集合內；champion list 不足 k 份時一次退回完整排序，tiered index 則一層一層往下。兩者不能同時使用。
+- **inexact top-k**：`idf_threshold`、`min_match`、`champions` 只縮小計算範圍。$|q|$ 一律用全部的 term 計算，所以開關這些選項不會改變分數的尺度。
 
 ### search.py：命令列介面
 
@@ -421,7 +388,7 @@ index 存的是 stem 之後的 term，原本的字形已經不見了：`running`
 
 ## API 參考
 
-程式碼裡沒有 docstring，每個函式的用途寫在它上一行的註解；較完整的說明集中在這裡。型別標註直接看程式碼。
+陳長壻的模組沒有 docstring，每個函式的用途寫在它上一行的註解；較完整的說明集中在這裡。型別標註直接看程式碼。
 
 ### index_reader.py
 
@@ -469,20 +436,14 @@ index 存的是 stem 之後的 term，原本的字形已經不見了：`running`
 
 | 名稱 | 說明 |
 |---|---|
-| `SCHEMES` | 可用的計分方式 `("tfidf", "bm25")` |
-| `Ranker(idx, matcher=None, wildcard_limit=30, scheme="tfidf", k1=None, b=None)` | `scheme` 選 TF-IDF + cosine 或 BM25；`k1`、`b` 為 `None` 時依序取 `meta.json` 裡建 BM25 champion list 時的值、1.2 / 0.75。`wildcard_limit` 是一個 wildcard 最多用幾個展開詞來計分（取 df 最高的）。`scheme` 不在 `SCHEMES` 時丟出 `ValueError` |
-| `.rank(query, top_k=10, idf_threshold=None, min_match=1, champions=False, tiered=False)` | 回傳 `RankResult`。`top_k <= 0` 代表回傳全部 candidate。`idf_threshold`：idf 低於門檻的 query term 不計分（全部低於門檻時保留 idf 最高的一個）。`min_match`：只作用在 free text，文件至少要含幾個 query term。`champions`：只對 champion list 聯集內的文件計分，結果不足 `top_k` 筆時改用完整的 candidate 重新排序。`tiered`：由 tier 1 開始，不足 `top_k` 筆就加入下一層，最後一層等於完整排序。`champions` 和 `tiered` 同時為真時丟出 `ValueError`。內部參數 `_tier_level` 不要自己傳 |
-| `RankResult` | `hits`（`(doc_id, score)`，分數高的在前）、`num_candidates`、`terms_used`（term → query tf）、`terms_dropped`、`champions_fallback`、`tiers_used` / `tiers_total`（tiered 模式讀了幾層 / 總共幾層，含不另外存的最後一層；其他模式為 `None`） |
+| `Ranker(idx, matcher=None, wildcard_limit=30)` | TF-IDF + cosine 排序；`wildcard_limit` 是一個 wildcard 最多用幾個展開詞來計分（取 df 最高的） |
+| `.rank(query, top_k=10, idf_threshold=None, min_match=1, champions=False)` | 回傳 `RankResult`。`top_k <= 0` 代表回傳全部 candidate。`idf_threshold`：idf 低於門檻的 query term 不計分（全部低於門檻時保留 idf 最高的一個）。`min_match`：只作用在 free text，文件至少要含幾個 query term。`champions`：只對 champion list 聯集內的文件計分，結果不足 `top_k` 筆時改用完整的 candidate 重新排序 |
+| `RankResult` | `hits`（`(doc_id, score)`，分數高的在前）、`num_candidates`、`terms_used`（term → query tf）、`terms_dropped`、`champions_fallback` |
 | `.query_terms(query)` | 處理過的 term → 在 query 中的次數，只取不在 NOT 底下的葉節點 |
-| `.champion_docs(term)` | 一個 term 的 champion doc_id；依 `scheme` 讀 `champions.tsv` 或 `champions_bm25.tsv`（檔名取自 `meta.json`），每個 process 只讀一次，每個 term 第一次用到時才解析 |
-| `.tier_docs(term, level)` | 一個 term 在 tier 0 到 `level`（從 0 起算）的 doc_id 聯集；依 `scheme` 讀 `tiers.tsv` 或 `tiers_bm25.tsv`，同樣延遲解析 |
-| `.stored_tiers()` | 檔案裡存了幾層（= `meta.json` 的 `tiers.sizes` 長度）；沒有建 tiered index 時丟出 `FileNotFoundError` |
-| `.bm25_idf(term)` | $\ln(1+\frac{N-df+0.5}{df+0.5})$，不在 index 的 term 為 0 |
-| `.bm25_denominators()` | 每份文件的 $k_1(1-b+b|d|/\text{avgdl})$，讀 `doc_lengths.tsv` 後快取；缺檔或 `meta.json` 沒有 avgdl 時丟出 `FileNotFoundError` |
-| `.champion_params_differ(section="champions")` | BM25 模式下，`meta.json` 的 `champions`（或 `"tiers"`）記錄的 $k_1$、$b$ 和目前的不同時回傳 `True` |
+| `.champion_docs(term)` | 一個 term 的 champion doc_id；`champions.tsv` 每個 process 只讀一次，每個 term 第一次用到時才解析 |
 | `.doc_weight(tf, idf)` / `.query_weight(qtf, idf)` | 投影片的權重公式 |
 
-公式：TF-IDF 為 $w_{t,d}=(1+\log tf_{t,d})\log(N/df_t)$，query 端相同，$\text{score}(q,d)=\sum_t w_{t,q}w_{t,d}/(|q|\,|d|)$；BM25 見「BM25」一節。
+公式：$w_{t,d}=(1+\log tf_{t,d})\log(N/df_t)$，query 端相同；$\text{score}(q,d)=\sum_t w_{t,q}w_{t,d}/(|q|\,|d|)$。
 
 ### spell.py
 
@@ -508,7 +469,7 @@ index 存的是 stem 之後的 term，原本的字形已經不見了：`running`
 | `main(argv=None)` | 程式入口，回傳 exit code（index 打不開時是 1） |
 | `run_one(ranker, text, args, qid, speller=None)` | 處理一個 query：拼字檢查、parse、rank、格式化；回傳 `(結果行, 診斷行)` |
 | `iter_batch(path)` | 逐一回傳 batch 檔中的 `(qid, query)`；空行和 `#` 開頭的行會被略過，沒有 `qid:` 前綴時以行號當 qid |
-| `build_arg_parser()` / `print_settings(args, ranker, out)` | 命令列選項；啟動時把所有設定（含計分方式和 BM25 參數）印到 stderr |
+| `build_arg_parser()` / `print_settings(...)` | 命令列選項；啟動時把所有設定印到 stderr |
 
 ### prep.py
 
@@ -516,7 +477,7 @@ notebook 依序呼叫的就是這些函式；`run()` 是 `python prep.py` 的完
 
 | 名稱 | 說明 |
 |---|---|
-| `run(index_dir, warc_path, log_base, schemes, r, k1, b, verify, seed, surface, tier_sizes)` | 依序執行全部步驟和驗證，回傳 `meta.json` 的內容；`tier_sizes` 不是正的遞增數列時丟出 `ValueError` |
+| `run(index_dir, warc_path, log_base, schemes, r, k1, b, verify, seed, surface)` | 依序執行全部步驟和驗證，回傳 `meta.json` 的內容 |
 | `scan_warc_doc_ids(warc_path)` | `[(doc_id, trec_id, url), ...]`，編號方式和 `hw1.parse_warc` 完全相同（每筆 response record 一個 id） |
 | `iter_postings_records(postings_path)` | 逐一回傳 `postings.txt` 每行的 `(byte offset, term, df, [(docID, tf), ...])`（bytes），並檢查格式和 df |
 | `scan_postings(postings_path, log_base)` | 第一次掃描，回傳 `PostingsScan`：`term_entries`（term, df, offset）、norm 的三個和 `s0`/`s1`/`s2`、`doc_lengths`、每個 term 的 `term_cf`、`num_postings`、`postings_bytes` |
@@ -524,12 +485,178 @@ notebook 依序呼叫的就是這些函式；`run()` 是 `python prep.py` 的完
 | `compute_doc_norms(scan, N, log_base)` | 用展開式 $\sqrt{L^2S_0-2LS_1+S_2}$ 算出每份文件的 $\lVert d\rVert$ |
 | `average_doc_length(doc_lengths, N)` | avgdl |
 | `write_champions(...)` / `top_r_docs(...)` / `champion_scorers(...)` | 第二次掃描，逐 scheme 寫出 champion list；每個 term 依該 scheme 的分數取前 r 份，同分時 doc_id 小的優先，輸出依 doc_id 遞增 |
-| `write_tiers(...)` / `split_tiers(pairs, scorer, sizes)` | 第三次掃描，逐 scheme 寫出 tiered index；排序方式和 champion list 相同，依 `sizes` 切成各層，每層依 doc_id 遞增。`tier_sizes` 為空時不寫檔，並刪除舊檔 |
 | `scan_surface_vocab(warc_path, cfg)` | `(原始字形, term) → [cf, df]`，用 HW1 的 tokenize + linguistic |
 | `write_surface_vocab(index_dir, vocab, index_terms)` | 只寫出 term 在 index 裡的字形；回傳（寫出行數, 丟棄組數） |
 | `surface_step(index_dir, warc_path, scan, enabled)` | 有 WARC 且 `enabled` 時重建詞表；否則若既有的檔案是針對同一份 `postings.txt` 建的就沿用。回傳 `meta.json` 的 `surface_vocab` 欄位（沒有可用的詞表時為 `None`） |
 | `write_tables(...)` / `build_meta(...)` / `write_meta(...)` | 寫出表格檔與 `meta.json`（一律 LF 換行） |
-| `verify_dictionary` / `verify_seeks` / `verify_doc_stats` / `verify_champions` / `verify_tiers` / `verify_surface_vocab` | 各項驗證，失敗時丟出 `AssertionError` |
+| `verify_dictionary` / `verify_seeks` / `verify_doc_stats` / `verify_champions` / `verify_surface_vocab` | 各項驗證，失敗時丟出 `AssertionError` |
+
+## 鄧存正新增的部分
+
+以下各節是在陳長壻的程式之上加的功能。**所有新選項都關閉時，執行的路徑和計算式與原本相同，`queries.txt` 的三份結果（`results.txt`、`results_champions.txt`、`results_spell_correct.txt`）逐 byte 不變。**
+
+### Weighting schemes（Ch.6，`weighting.py`）
+
+`--scheme ddd.qqq` 用課本 Fig. 6.15 的 SMART 記法，前三個字母是文件端，後三個是查詢端：
+
+| 位置 | 字母 | 公式 |
+|---|---|---|
+| tf | `n` / `l` / `a` / `b` / `L` | $tf$ ／ $1+\log tf$ ／ $0.5+0.5\,tf/\max tf$ ／ 1 ／ $(1+\log tf)/(1+\log \text{avg}\,tf)$ |
+| idf | `n` / `t` / `p` | 1 ／ $\log(N/df)$ ／ $\max(0,\log\frac{N-df}{df})$ |
+| normalization | `n` / `c` | 無 ／ cosine（除以向量長度） |
+
+- 共 $(5\times3\times2)^2=900$ 種組合。預設 `ltc.ltc` 就是投影片第 4 頁的公式；`lnc.ltc` 是課本的範例。只寫三個字母（`--scheme lnc`）代表兩端相同。
+- `a` 需要每份文件的 max tf，`L` 需要平均 tf（$|d|$ ÷ 相異 term 數），`c` 需要該組 tf×idf 的向量長度。這些都由 `prep_extra.py` 一次算好放在 `doc_stats.tsv`（15 欄向量長度），查詢時只讀用到的欄位。`lt` 那一欄和陳長壻的 `doc_norms.tsv` 相對誤差 < 1e-9，預設 scheme 仍讀 `doc_norms.tsv`。
+- 查詢端的 `a`、`L` 用 query 自己的 max tf 和平均 tf。
+- `--scheme bm25`：$\sum_t qtf_t\cdot\ln\!\big(1+\frac{N-df+0.5}{df+0.5}\big)\cdot\frac{tf\,(k_1+1)}{tf+k_1(1-b+b\,|d|/\text{avgdl})}$，`--k1`、`--b` 可調。idf 用加 1 的版本，df 超過 N/2 時也不會變成負數。分數不在 [0, 1] 內。
+- BM25 模式下 `--champions` 會改讀 `champions_bm25.tsv`；`--k1`/`--b` 和建 champion list 時不同的話，`-v` 會印出提醒（list 仍可用，只是挑選標準和計分標準不完全一致）。
+- log 底數、「df = 0 或 df = N 的 term 不計分」、同分時 docID 小者在前，這些規則所有 scheme 都相同。
+
+### tf index：impact ordering 與 tiered index 共用的結構（Ch.7，`tf_index.py`）
+
+`postings.txt` 每行含 positions，排序時要用 regex 掃過整行才拿得到 (doc, tf)。`tf_index.bin` 是不含 positions 的第二份 postings：**每個 term 的文件依 tf 分組，tf 大的組在前，組內 docID 遞增**（uint32 陣列，可以直接二分搜尋）。
+
+- 每組前面記兩個上界：這一組**和之後所有組**裡，一份文件最多能貢獻多少，分別針對 ltc cosine（$\max (1+\log tf)/\lVert d\rVert$）和 BM25（tf 部分的最大值）。寫成 float32 時乘上 $1+10^{-6}$，確保捨入後仍是上界。
+- 898 萬筆 posting 分成 57 萬組，檔案 46 MB，建立約 10 – 20 秒。`tf_index.json` 記著它對應的 `postings.txt` 大小，對不上就重建。
+- **`--tf-index`**：只換資料來源，排序仍是精確的，結果和預設逐 byte 相同。
+
+**Impact ordering（`--impact`，課本 7.1.5）。**
+
+1. query term 依「最多能貢獻多少」由大到小處理（query tf 相同時就是 idf 由大到小）。
+2. 每個 term 的 postings 依 tf 由大到小一組一組讀。
+3. 讀每一大組之前檢查：目前第 k 名的分數，是否已經高於「一份還沒出現過的文件最多還能拿到的分數」（這一組的上界 + 後面所有 term 的上界）。成立之後就不再建立新的 accumulator。
+4. 之後剩下的 postings 只替已經有 accumulator 的文件補分數（文件少時對每組做二分搜尋），並持續丟掉追不上第 k 名的文件。
+
+因為停止條件是安全的，**top-k 和精確排序相同**（Web Track 200 題全部一致），而且回傳的分數是完整的分數。它不是近似，而是把課本的 early termination 做成不會出錯的版本。限制：上界只存了 ltc 文件端和 BM25（預設 k1、b）兩種；其他 scheme、`-k 0`、`--min-match` 時不提早結束（`-v` 會說明），結果仍然正確。
+
+**Tiered index（`--tiered`，課本 7.2.1）。** tier 直接用 tf 的範圍定義，門檻由 tf 分佈決定（讓 tier 1 不超過 10%、tier 1+2 不超過 35% 的 postings）：
+
+| tier | tf | postings 佔比 |
+|---|---|---|
+| 1 | ≥ 4 | 9.6% |
+| 2 | 2–3 | 21.8% |
+| 3 | 1 | 68.6% |
+
+查詢時先收集所有 query term 在 tier 1 的文件；不足 k 份才加入 tier 2，再不足才加入 tier 3（三層都讀完就等於精確）。候選文件決定後，它們的分數用**全部 tier** 算，所以印出的分數和精確排序時相同，只是候選集合比較小。
+
+### Cluster pruning（`--cluster B1,B2`，課本 7.1.6，`clusters.py`）
+
+- 前處理：隨機選 $\sqrt{N}\approx177$ 份文件當 leader（seed 固定，重建結果相同），算出每份文件和每個 leader 的 ltc cosine，記下最近的 3 個 leader。
+- 查詢：算 query 和 177 個 leader 的 cosine，取最近的 B2 個；候選文件是「最近的 B1 個 leader 之一在這 B2 個裡面」的文件。候選文件的分數是完整的分數。
+- 候選不足 k 份時，B2 加倍重試，直到用完所有 leader，最後退回精確排序。
+- 可以和 `--impact`、`--scheme` 一起用。leader 之間的相似度固定用 ltc cosine。
+
+### 一般形式的 wildcard：k-gram index（Ch.3，`kgram.py`）
+
+原本中間有 `*` 或有多個 `*` 的 pattern，要先用開頭的固定字串縮小範圍，再用 regex 逐一比對；開頭就是 `*` 時（`*comput*`）等於掃過 34 萬個 term 和 40 萬個原始字形。現在照課本 3.2.2：
+
+- 每個 index term 和原始字形前後加上 `$`，切成 3-gram，建立「gram → 字串編號」的索引（63,557 個 gram、551 萬筆，22 MB，建立約 1 – 3 秒）。
+- pattern 以 `*`、`?` 切開後取出所有 3-gram（`c*t*r` → 沒有；`*comput*` → `com omp mpu put`；`m*soft` → `$m` 不足 3 字不取，`sof oft ft$`），從最短的 list 開始取交集。
+- **交集只是必要條件**（`red*` 會找到 `retired`），所以最後仍用原本的 regex 過濾。
+- 取不出任何 3-gram 的 pattern（如 `c*t*r`、`*a*`）沿用原本的掃描；單純的 `prefix*` 沿用 bisect。
+
+和原本的實作比對 408 個 pattern（24 個手寫 + 384 個隨機產生），展開結果完全相同；其中 317 個走 k-gram。在開發用的 Linux 沙盒上，`*comput*` 從 85 ms 降到 1.0 ms，`*ation*al` 從 436 ms 降到 1.9 ms。
+
+### 網頁 demo 與查詢詞標示（`ui.py`）
+
+```
+python ui.py              # http://localhost:8000
+python ui.py 8765         # 換 port
+```
+
+單一檔案，只用標準函式庫（`http.server`），沒有新增套件。排序直接呼叫 `Ranker`、`parse_query`、`SpellCorrector`，所以結果和 `search.py` 相同。伺服器是單執行緒的，所有 request 共用同一個 index file handle；伺服器端的例外會把 traceback 同時印在終端機和頁面上，方便除錯。
+
+- **輸入**：搜尋框；top-k、weighting scheme、搜尋方法（exact / champion lists / impact / tiered / cluster）、拼字模式、Soundex。頁面上的語法表列出每種功能並附範例，點範例就會直接執行。
+- **輸出**：每筆結果一列，有分數長條、標題（連結到原網址）、摘要、URL 與 TREC-ID，以及詞頻表：每個查詢詞一欄（wildcard 合併成一欄，值是所有展開詞的 tf 總和），格子是該詞在文件中的 tf。列的底色表示文件含有幾個查詢詞：綠色全部、黃色部分、紅色都沒有，表格上方另有「X/k results contain all terms」，讓人一眼判斷結果是否合理。
+- **標題與摘要**：WARC 是單一 gzip 串流，無法依 offset 隨機讀取，所以第一次啟動時會在背景執行緒用 HW1 的 `parse_warc` 掃一次 WARC（約 2–4 分鐘），把每份文件的標題和前 2 萬字內文寫進 `output/doc_text.tsv`（約 145 MB），並逐筆比對 TREC-ID 確認和 index 的 docID 一致。建置期間仍可搜尋，頁面會顯示進度；之後啟動時直接讀快取。摘要是含有最多不同查詢詞的 30 個字，查詢詞以和 index 相同的 tokenizer + linguistic 比對後標成黃色（所以 `business` 也會標出 `businesses`）。程式會在解壓後的資料夾（`<ID>_HW2/`）和上一層資料夾找 `07.warc.gz`；找不到時照常搜尋，只是沒有標題和摘要。
+
+### 封裝：壓到 64 MB 以內（`pack_index.py`）
+
+| 內容 | 大小 |
+|---|---|
+| `postings.txt` 原檔 | 201.1 MB |
+| zip（deflate） | 63.2 MB |
+| xz | 45.0 MB |
+| **改存間隔後再 xz（`postings.delta.xz`）** | **31.1 MB** |
+
+- 每行改寫成 `term<TAB>docID間隔:position間隔,...;...`。df 和 tf 不存，還原時由 posting 數和 position 數得到（封裝時會檢查兩者確實相等）。
+- 還原是純 Python 標準函式庫（`lzma`），約 15 秒。先寫到暫存檔，**大小和 SHA-256 都和 `postings.pack.json` 記的相同才改名成 `postings.txt`**，所以中途被打斷不會留下壞檔，`offsets.tsv` 裡的 byte offset 也保證仍然有效。
+- 可以由 postings 重建、而且重建很快的 `tf_index.*`（49 MB）和 `kgram.*`（24 MB）不放進壓縮檔，第一次用到時自動建立。其餘前處理結果都在壓縮檔裡。
+- 整個壓縮檔約 55.4 MB（52.8 MiB），由 `build.py package` 產生。
+
+### 正確性與效能（`evaluate.py`，完整輸出在 `results/evaluation.md`）
+
+**沒有官方的測試 query**，所以用 TREC Web Track 2009–2012 的 200 個公開 topic（它們就是針對 ClueWeb09 寫的）加上 24 個手寫的邊界情況（全是 stopword、index 裡沒有的字、含 hyphen 的字、數字、小寫 `and`/`or`、重複的字、極常見的字、簡單 Boolean）。
+
+**正確性**：Correctness: search.py against an independent brute-force scorer
+
+| scheme | queries | documents compared | max abs. score difference | rankings identical |
+|---|---|---|---|---|
+| ltc.ltc | 224 (6 with no result) | 1,049,547 | 3.7e-15 | 224 / 224 |
+| lnc.ltc | 60 (4 with no result) | 298,393 | 4.4e-16 | 60 / 60 |
+| nnc.ntc | 60 (4 with no result) | 298,393 | 2.2e-16 | 60 / 60 |
+| ntn.ntn | 60 (4 with no result) | 298,393 | 0.0e+00 | 60 / 60 |
+| anc.atc | 60 (4 with no result) | 298,393 | 8.0e-16 | 60 / 60 |
+| atc.atc | 60 (4 with no result) | 298,393 | 1.7e-16 | 60 / 60 |
+| bnn.bpn | 60 (4 with no result) | 298,393 | 0.0e+00 | 60 / 60 |
+| Lpc.ltc | 60 (4 with no result) | 298,393 | 2.0e-16 | 60 / 60 |
+| Ltc.Ltc | 60 (4 with no result) | 298,393 | 1.5e-16 | 60 / 60 |
+| lpc.apc | 60 (4 with no result) | 298,393 | 1.4e-16 | 60 / 60 |
+| bm25 | 60 (4 with no result) | 298,393 | 3.6e-15 | 60 / 60 |
+
+Every score of every matching document is compared (top-k = all). The brute-force scorer shares only HW1's tokenizer and record parser with search.py: it builds full document vectors from postings.txt and applies the SMART / BM25 definitions directly, including each document's vector length.
+
+**效能**：Inexact top-10: time and agreement with the exact ranking
+
+| method | ms / query | speed-up | postings scored / query | mean overlap@10 | identical top-10 (same order) | queries widened |
+|---|---|---|---|---|---|---|
+| exact, postings.txt (baseline) | 6.59 | 1.00x | 5,335 | - | - | 0 |
+| exact, tf index (`--tf-index`) | 3.00 | 2.20x | 5,335 | 1.000 | 200 / 200 | 0 |
+| index elimination `--idf-threshold 1.0` | 2.09 | 3.16x | 1,642 | 0.908 | 121 / 200 | 0 |
+| index elimination `--min-match 2` | 6.22 | 1.06x | 5,335 | 0.630 | 78 / 200 | 0 |
+| champion lists `--champions` (r = 50) | 4.32 | 1.53x | 117 | 0.982 | 184 / 200 | 4 |
+| tiered index `--tiered` | 0.83 | 7.96x | 1,119 | 0.519 | 28 / 200 | 0 |
+| impact ordering `--impact` | 0.79 | 8.34x | 1,924 | 1.000 | 200 / 200 | 0 |
+| cluster pruning `--cluster 1,4` | 0.67 | 9.88x | 498 | 0.220 | 14 / 200 | 29 |
+| cluster pruning `--cluster 3,8` | 1.29 | 5.10x | 1,404 | 0.399 | 21 / 200 | 21 |
+| impact + cluster `--impact --cluster 3,8` | 0.89 | 7.42x | 860 | 0.399 | 21 / 200 | 21 |
+| BM25 exact, postings.txt | 6.39 | 1.00x | 5,335 | - | - | 0 |
+| BM25 `--champions` | 4.28 | 1.49x | 126 | 0.853 | 122 / 200 | 4 |
+| BM25 `--tiered` | 0.82 | 7.78x | 1,119 | 0.770 | 78 / 200 | 0 |
+| BM25 `--impact` | 0.69 | 9.26x | 1,520 | 1.000 | 200 / 200 | 0 |
+
+（時間在開發用的 Linux 沙盒上量測；隊友在 Windows 筆電上量到的時間約為這裡的兩倍，相對快慢和 overlap 相同。）
+
+200 free-text queries (TREC Web Track 2009-2012 topics), top-10, best of 3 timed passes after one warm-up pass, single process, postings in the OS file cache. Overlap is the share of the exact top-10 that the method also returns, averaged over the queries with at least one result. "Queries widened" counts queries where the pruned candidate set held fewer than 10 documents and the search fell back to a wider or exact set (that time is included).
+
+- **沒有算 MAP / P@10**：Web Track 四年的 relevance judgment 共 79,431 筆，其中只有 47 筆屬於我們這個子集（`clueweb09-en0000-07-*`），判為相關的只有 15 筆、集中在 5 個 topic，不足以比較 scheme 的好壞。
+- **tiered 和 cluster pruning 的 overlap 偏低是方法本身的性質**：tier 只看 tf，而 cosine 會除以文件長度，tf 高的多半是長文件；BM25 對長度的懲罰較輕，所以同樣的 tier 在 BM25 下 overlap 高得多。Cluster pruning 用隨機 leader，而 query 只有兩三個詞，和 leader 的相似度很不穩定。
+- champion list 的 overlap 最高，但它仍要從 `postings.txt` 讀出整行才知道 tf，所以時間省得不多；`--impact` 兩者兼得。
+
+### 新模組的 API
+
+| 名稱 | 說明 |
+|---|---|
+| `weighting.Scheme(idx, spec="ltc.ltc", k1=1.2, b=0.75)` | 解析 `ddd.qqq` 或 `bm25`；格式不對時丟出 `SchemeError` |
+| `.doc_weight_fn(term)` | 回傳函式 `(doc_id, tf) → 未正規化的文件端權重`（含 idf） |
+| `.query_weights(qtf)` | `(term → 查詢端權重, 查詢向量長度)` |
+| `.doc_norms()` | 此 scheme 文件端的向量長度（不做 cosine 時全為 1） |
+| `.bound_kind(tf_index_meta)` | `tf_index.bin` 裡哪一種上界適用：`"ltc"`、`"bm25"` 或 `None` |
+| `tf_index.TfIndex.open(idx)` | 開啟 tf index，不存在或過期時先建立 |
+| `.blocks(term)` | `Block(tf, docs, bound_ltc, bound_bm25)` 的 list，tf 由大到小 |
+| `.doc_tfs(term, allowed=None)` | `(doc_id, tf)`；給 `allowed` 時只回傳集合內的文件 |
+| `.tier_docs(term, tier)` / `.tier_of(tf)` / `.tier_min_tf` | tiered index 的存取 |
+| `tf_index.build(index_dir)` | 由 `postings.txt`、`doc_norms.tsv`、`doc_lengths.tsv` 建立三個檔 |
+| `clusters.Clusters(idx)` / `.candidates(qtf, b1, b2)` / `.nearest_leaders(qtf)` | cluster pruning 的查詢端 |
+| `clusters.build(idx, tfi, seed=27)` | 選 leader、算相似度、寫出兩個 tsv |
+| `kgram.KGramIndex(index_dir)` / `.candidates(pattern)` | `(term 編號, 字形編號)`，是符合 pattern 的超集；pattern 取不出 3-gram 時回傳 `None` |
+| `kgram.pattern_grams(pattern)` / `kgram.grams_of(text)` | pattern 必須包含的 3-gram／一個字串的所有 3-gram |
+| `pack_index.pack(index_dir)` / `.unpack(index_dir)` / `.ensure_postings(index_dir)` | 封裝、還原、需要時才還原 |
+| `Ranker(idx, ..., scheme=None)` | 新增 `scheme`；`None` 即 `ltc.ltc` |
+| `Ranker.rank(..., tiered=False, impact=False, cluster=None, tf_index=False)` | 新增的四個選項；`RankResult` 多了 `notes`（給 `-v` 的說明）和 `postings_scored` |
+| `Matcher.use_kgram` | 設成 `False` 可強制走原本的掃描（比對兩種實作用） |
+
+`prep_extra.py` 的選項：`--only tf_index doc_stats clusters kgram`（只建指定的部分）、`--force`（全部重建）、`--no-verify`。驗證會抽 320 個 term 確認 tf index 和 `postings.txt` 的 (doc, tf) 完全相同、上界確實不小於實際貢獻，並抽 22 份文件用 HW1 的 parser 直接套公式重算 `doc_stats.tsv` 的每一欄（相對誤差 < 1e-9）。
 
 ## 驗證方式
 
@@ -543,7 +670,7 @@ python ranker.py 'your query'          # top 5 及分數
 python prep.py                         # 前處理，最後會跑驗證
 ```
 
-開發時在沙盒裡做過以下交叉驗證，對照組都是另外寫、演算法不同的暴力版本。matcher、ranker、spell / wildcard 的項目是在 HW1 交件版的 index 上做的（這些模組之後沒有修改）；BM25、tiered index、prep 的項目在重建的 index 上重新跑過一次，結果相同：
+開發時在沙盒裡做過以下交叉驗證，對照組都是另外寫、演算法不同的暴力版本：
 
 - matcher：18 個指定 query 加 1,500 組隨機 term 組合，結果和用 Python set 實作的 naive evaluator 完全一致。wildcard 展開和 `fnmatch` 掃整個字典的結果相同。
 - ranker：14 個 query 的每份 candidate，分數和直接套公式的結果誤差 < 1e-16，排序相同，分數都落在 [0, 1]。
@@ -557,38 +684,19 @@ python prep.py                         # 前處理，最後會跑驗證
   - 修正正確率：從出現 200 次以上的字隨機製造一個錯誤（刪除、插入、替換、交換），修回原字的比例是 88.7%（399/450）；長度 7 以上的字製造兩個錯誤，修回原字的比例是 78.6%（209/266）。
   - query 改寫：引號、括號、`AND`/`OR`/`NOT`、wildcard、`/3`、`mp3` 都保持原樣。
   - 開啟 spell / wildcard 的新功能後，`queries.txt` 中原有 query 的排序結果和改版前逐 byte 相同。
-- BM25（對照組直接 parse `postings.txt`，不經過專案的程式）：
-  - 自己加總每份文件的 tf，31,480 份的 $|d|$ 都和 `doc_lengths.tsv` 相同，avgdl 和 `meta.json` 相同。
-  - 6 個 free text query（含重複詞的 `business business hong`）的前 20 名，doc 和分數都和暴力 BM25 相同（誤差 < 1e-6）。
-  - 3 個 Boolean / phrase query：每個結果的分數都正確；把 filter 出來的整組文件用暴力 BM25 重新排序，前 20 名也相同。
-  - `champions_bm25.tsv` 抽查的 term 都是正確的 top-50；`-w bm25 --champions` 的結果等於「暴力 BM25 只在 champion 聯集裡排序」。
-- tiered index：
-  - `prep.py` 的 `verify_tiers` 抽 320 個 term（含 df 最大的 20 個），兩種 scheme 的每一層都和完整排序後切出來的結果相同。tier 1 + tier 2 的 docID 總數也和「每個 term 取 min(df, 200)」的加總相同。
-  - 查詢端：另外寫的暴力版直接從 postings 算出每個 term 的名次、決定要讀到第幾層、在候選文件上算精確分數。11 個 query × 兩種計分方式 × k = 10 / 50，共 44 組，前 k 名、分數、讀到的層數全部相同。
-- 加入 BM25 和 tiered index 後，`results.txt`、`results_champions.txt`、`results_spell_correct.txt` 重跑的結果和加入前逐 byte 相同。
 - **模擬助教的環境**：把交件用的壓縮檔解到全新的資料夾，用全新的 Python 虛擬環境只安裝 `requirements.txt`，並在沒有網路、沒有任何 NLTK 資料的狀態下執行互動、單一 query 和 batch 三種模式，結果和開發環境相同。
 
 ## 已知限制
 
-- **index 和 HW1 交件版不完全相同**：見「建置流程」一節。用 HW1 交件版的 index 也能執行（重跑 `prep.py` 即可），但原始字形詞表會有約 0.25% 的 index term 沒有對應的字形，這些 term 仍然可以用 stem 的 wildcard 找到。
-- **很寬的 wildcard 在 Boolean 模式下很慢。** 例如 `*ing AND linux`：`*ing` 會展開成 8,290 個 term，Boolean 模式必須讀完它們全部的 postings，約需 10 秒。free text 模式只用 df 最高的 30 個來計分，不受影響。
+- **index 和 HW1 交件版不完全相同**：見「建置流程」一節。原始字形詞表必須和 index 在同一個平台上產生才會完全一致；`build.py` 一律在同一台電腦上依序產生兩者，所以涵蓋率是 100%。
+- **很寬的 wildcard 在 Boolean 模式下很慢。** 例如 `*ing AND linux`：`*ing` 會展開成 8,290 個 term，Boolean 模式必須讀完它們全部的 postings，約需 6 – 8 秒。free text 模式只用 df 最高的 30 個來計分，不受影響。
 - **拼字修正無法處理 collection 本身常見的錯字。** 網頁上 `teh`、`recieve`、`definately` 都出現數十次以上，會被視為正確的字。門檻（50 次、50 倍）是在「常見錯字」和「真實但少見的字」（`tcp` 74 次，旁邊有出現 1 萬多次的 `top`）之間取捨的結果。
 - **Soundex 很粗略。** 它只看子音的類別，`fonetik` → `phonetic` 這類修正大多做不到，所以 `--phonetic` 只是在距離相同時偏好發音相近的字，不會取代 edit distance。
 - **只支援 HW1 的單行 postings 格式**（`multiline=False`，也就是交件時的設定）。
 - **proximity 的距離以原始 token 位置計算**，被移除的 stopword 也佔位置。
-- **champion list 和 tiered index 的加速有限**：postings 仍然要整條讀出來，見「Champion lists」、「Tiered index」兩節的說明。
-- **tiered index 在 BM25、常見詞組成的 query 上和精確結果差異較大**：見「Tiered index」一節的表格。這是 inexact top-k 本來就有的取捨，需要精確結果時不要加 `--tiered`。
+- **champion list 的加速有限**：見「Champion lists」一節的說明。
 
-## 加分項完成狀況
+## 未做的加分項
 
-對照投影片的 optional features：
-
-| 投影片項目 | 狀態 | 用法 |
-|---|---|---|
-| phrase、proximity、wildcard、substring、複雜 Boolean | 完成 | 見「查詢語法」；substring 用 `*olog*` 這種兩端都有 `*` 的 wildcard |
-| spell correction、phonetic correction | 完成 | `--spell suggest/correct`、`--phonetic` |
-| 其他 term weighting | 完成：BM25 | `-w bm25` |
-| index elimination | 完成 | `--idf-threshold`、`--min-match` |
-| champion lists | 完成（cosine 與 BM25 兩種排序） | `--champions` |
-| tiered index | 完成（cosine 與 BM25 兩種排序） | `--tiered` |
-| Web / App 介面、query term highlighting | 未實作 | — |
+- App 形式的介面（只做了網頁 demo `ui.py`）。
+- 交件的壓縮檔裡沒有 WARC（178 MB 放不進 64 MB），所以 `ui.py` 的標題、摘要和摘要中的查詢詞標示，要把 `07.warc.gz` 放在解壓後的資料夾（`<ID>_HW2/`）或上一層才會出現；沒有 WARC 時其餘功能（排序、詞頻表）照常。

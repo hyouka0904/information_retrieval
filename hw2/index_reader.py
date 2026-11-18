@@ -14,6 +14,8 @@ import nltk
 nltk.data.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "nltk_data"))
 # HW1 code: Config, PostingEntry and the postings record parser
 import hw1_indexer as hw1
+# restores postings.txt from its packed form when needed
+import pack_index
 
 # matches the start of every posting "docID, tf: <" inside a record body
 _PAIR_RE = re.compile(rb"(\d+), (\d+): <")
@@ -28,6 +30,8 @@ class IndexReader:
         self.index_dir = index_dir
         # path of the postings file that offsets point into
         self.postings_path = os.path.join(index_dir, "postings.txt")
+        # the submission ships postings.txt in packed form (64 MB upload limit); restore it on the first run
+        pack_index.ensure_postings(index_dir)
 
         # read global statistics written by the prep notebook
         with open(os.path.join(index_dir, "meta.json"), encoding="utf-8") as f:

@@ -37,17 +37,12 @@ DEFAULT_BM25_B = 0.75
 CHAMPION_SCHEMES = ("cosine", "bm25")
 # output file of each champion scheme (ranker.py reads champions.tsv for cosine)
 CHAMPION_FILES = {"cosine": "champions.tsv", "bm25": "champions_bm25.tsv"}
-# rank boundaries of the tiered index: tier 1 = the best 20 documents of a term, tier 2 = ranks 21-200, tier 3 = the rest
-DEFAULT_TIER_SIZES = (20, 200)
-# output file of each tier ordering (same orderings as the champion lists)
-TIER_FILES = {"cosine": "tiers.tsv", "bm25": "tiers_bm25.tsv"}
 
 # text shown by --help (the full explanation is in README.md)
 HELP_TEXT = """HW2 one-time preprocessing: adds what HW1's index lacks for ranking, without rebuilding the index.
 
   python prep.py                                  everything with the defaults
   python prep.py --champion-schemes cosine        build only the cosine champion lists
-  python prep.py --tier-sizes 50 500              tiered index with tiers of ranks 1-50, 51-500 and the rest
   python prep.py --no-warc                        ignore 07.warc.gz (N falls back to the largest doc_id)
   python prep.py --no-surface                     keep the existing surface_vocab.tsv (saves about 4 minutes)"""
 # matches the start of every posting "docID, tf: <" inside a record body
@@ -424,69 +419,6 @@ def write_champions(postings_path: str, index_dir: str, schemes: Sequence[str], 
 
 
 # ----------------------------------------------------------------------
-# pass 3 over postings.txt: tiered index
-# ----------------------------------------------------------------------
-
-# doc_ids of each stored tier: tier i holds ranks [sizes[i-1], sizes[i]) of the champion ordering, each ascending
-def split_tiers(pairs: Sequence[Tuple[int, int]], scorer, sizes: Sequence[int]) -> List[List[int]]:
-    # how many documents the stored tiers hold together
-    keep = min(sizes[-1], len(pairs))
-    # best keep documents, best first, smaller doc_id on ties (same order as the champion lists)
-    ranked = heapq.nsmallest(keep, pairs, key=lambda p: (-scorer(p[0], p[1]), p[0]))
-    # rank boundaries of every stored tier
-    bounds = [0] + list(sizes)
-    # slice the ranking into tiers and sort each one by doc_id
-    return [sorted(d for d, _ in ranked[bounds[i]:bounds[i + 1]]) for i in range(len(sizes))]
-
-
-# pass 3: stream one tiers file per scheme; returns scheme -> doc_ids written per stored tier
-def write_tiers(postings_path: str, index_dir: str, schemes: Sequence[str], sizes: Sequence[int],
-                doc_norms: Dict[int, float], doc_lengths: Dict[int, int], n: int, avgdl: float,
-                k1: float = DEFAULT_BM25_K1, b: float = DEFAULT_BM25_B,
-                log_base: float = DEFAULT_LOG_BASE) -> Dict[str, List[int]]:
-    # schemes that actually get a file (none when the tiered index is switched off)
-    built = list(schemes) if sizes else []
-    # per-scheme scoring functions, the same ones that order the champion lists
-    scorers = champion_scorers(doc_norms, doc_lengths, n, avgdl, k1, b, log_base)
-    # one open file per scheme; newline="\n" keeps byte-identical files on Windows and Linux
-    files = {s: open(os.path.join(index_dir, TIER_FILES[s]), "w", encoding="utf-8", newline="\n") for s in built}
-    # scheme -> ids written per stored tier
-    counts = {s: [0] * len(sizes) for s in built}
-    # always close the files
-    try:
-        # one pass serves every scheme; skipped entirely when nothing is built
-        for _, term_b, _, raw_pairs in (iter_postings_records(postings_path) if built else ()):
-            # term as text
-            term = term_b.decode("utf-8")
-            # (doc_id, tf) as ints
-            pairs = [(int(d), int(tf)) for d, tf in raw_pairs]
-            # one line per scheme
-            for s in built:
-                # stored tiers of this term under this scheme
-                tiers = split_tiers(pairs, scorers[s], sizes)
-                # one "term<TAB>tier-1 docs<TAB>tier-2 docs ..." line; every term is listed, like the champion lists
-                files[s].write(term + "\t" + "\t".join(" ".join(map(str, t)) for t in tiers) + "\n")
-                # count the ids of every stored tier
-                for i, t in enumerate(tiers):
-                    # ids in tier i
-                    counts[s][i] += len(t)
-    # cleanup
-    finally:
-        # every tiers file
-        for f in files.values():
-            # flush and close
-            f.close()
-    # leftover files of schemes not built this time would describe an older run, so remove them
-    for s in CHAMPION_SCHEMES:
-        # scheme not built and an old file exists
-        if s not in built and os.path.exists(os.path.join(index_dir, TIER_FILES[s])):
-            # delete the stale file
-            os.remove(os.path.join(index_dir, TIER_FILES[s]))
-    # ids written per scheme and tier
-    return counts
-
-
-# ----------------------------------------------------------------------
 # writing the tables and meta.json
 # ----------------------------------------------------------------------
 
@@ -526,12 +458,9 @@ def write_tables(index_dir: str, scan: PostingsScan, doc_norms: Dict[int, float]
 # content of meta.json: global statistics and the settings every other file was built with
 def build_meta(scan: PostingsScan, doc_norms: Dict[int, float], n: int, n_source: str, max_doc_id: int,
                avgdl: float, log_base: float, has_doc_ids: bool, schemes: Sequence[str], r: int,
-               k1: float, b: float, surface_info: Optional[dict] = None,
-               tier_sizes: Sequence[int] = ()) -> dict:
+               k1: float, b: float, surface_info: Optional[dict] = None) -> dict:
     # champion settings, one entry per built scheme
     champions = {"r": r, "schemes": {}}
-    # tiered index settings, one entry per built scheme (None when it was not built)
-    tiers = {"sizes": list(tier_sizes), "schemes": {}} if tier_sizes and schemes else None
     # every scheme that was built
     for s in schemes:
         # file name and ordering rule
@@ -542,10 +471,6 @@ def build_meta(scan: PostingsScan, doc_norms: Dict[int, float], n: int, n_source
             entry.update({"k1": k1, "b": b})
         # record the scheme
         champions["schemes"][s] = entry
-        # the tiers file of the same scheme
-        if tiers is not None:
-            # same parameters, other file name
-            tiers["schemes"][s] = dict(entry, file=TIER_FILES[s])
     # everything HW2 needs besides the tables
     return {
         # number of documents used in idf = log(N / df)
@@ -576,8 +501,6 @@ def build_meta(scan: PostingsScan, doc_norms: Dict[int, float], n: int, n_source
         "champions": champions,
         # surface vocabulary description, None when it was never built
         "surface_vocab": surface_info,
-        # tiered index description, None when it was not built
-        "tiers": tiers,
     }
 
 
@@ -751,67 +674,6 @@ def verify_champions(postings_path: str, index_dir: str, scan: PostingsScan, sch
     return len(wanted)
 
 
-# rebuild the tiers of sampled terms by full sort and compare with the tiers files; returns terms checked per scheme
-def verify_tiers(postings_path: str, index_dir: str, scan: PostingsScan, schemes: Sequence[str],
-                 sizes: Sequence[int], doc_norms: Dict[int, float], doc_lengths: Dict[int, int], n: int,
-                 avgdl: float, k1: float, b: float, num_terms: int, rng: random.Random,
-                 log_base: float = DEFAULT_LOG_BASE) -> int:
-    # random sample of term indices
-    sample = set(rng.sample(range(len(scan.term_entries)), min(num_terms, len(scan.term_entries))))
-    # the most frequent terms are the interesting case (df > the largest size), so add the 20 largest
-    sample |= set(sorted(range(len(scan.term_entries)), key=lambda i: scan.term_entries[i][1])[-20:])
-    # sampled term -> its offset
-    wanted = {scan.term_entries[i][0]: scan.term_entries[i][2] for i in sample}
-    # scheme -> {term: list of tiers} read back from the files
-    stored: Dict[str, Dict[str, List[List[int]]]] = {s: {} for s in schemes}
-    # every built scheme
-    for s in schemes:
-        # read the tiers file
-        with open(os.path.join(index_dir, TIER_FILES[s]), encoding="utf-8", newline="\n") as f:
-            # every line, counted
-            for i, line in enumerate(f):
-                # term followed by one field per stored tier
-                fields = line.rstrip("\n").split("\t")
-                # line order must be dictionary order
-                assert fields[0] == scan.term_entries[i][0], f"{s}: line {i} is {fields[0]!r}"
-                # exactly one field per stored tier
-                assert len(fields) == len(sizes) + 1, f"{s}: wrong field count for {fields[0]!r}"
-                # keep sampled terms only
-                if fields[0] in wanted:
-                    # parsed ids of every tier
-                    stored[s][fields[0]] = [[int(x) for x in fld.split()] for fld in fields[1:]]
-            # every term must have a line
-            assert i + 1 == len(scan.term_entries), f"{s}: {i + 1} lines for {len(scan.term_entries)} terms"
-    # read sampled records directly with HW1's parser
-    with open(postings_path, "rb") as fp:
-        # every sampled term
-        for term, off in wanted.items():
-            # jump to its record
-            fp.seek(off)
-            # full postings list
-            _, _, plist = hw1.parse_posting_line(fp.readline().decode("utf-8"), attach_skips=False)
-            # every built scheme
-            for s in schemes:
-                # direct score of one posting under this scheme
-                if s == "cosine":
-                    # (1 + log tf) / ||d||
-                    score = lambda p: (1.0 + log_b(p.tf, log_base)) / doc_norms[p.doc_id]
-                # BM25 tf part
-                else:
-                    # tf (k1 + 1) / (tf + k1 (1 - b + b |d| / avgdl))
-                    score = lambda p: p.tf * (k1 + 1.0) / (p.tf + k1 * (1.0 - b + b * doc_lengths[p.doc_id] / avgdl))
-                # full sort, best first, smaller doc_id on ties
-                ranked = [p.doc_id for p in sorted(plist, key=lambda p: (-score(p), p.doc_id))]
-                # rank boundaries
-                bounds = [0] + list(sizes)
-                # expected tiers, each in ascending doc_id
-                expect = [sorted(ranked[bounds[k]:bounds[k + 1]]) for k in range(len(sizes))]
-                # file content must match
-                assert stored[s][term] == expect, f"{s}: tiers of {term!r} differ"
-    # number of terms checked per scheme
-    return len(wanted)
-
-
 # structure and mapping checks of surface_vocab.tsv, plus how much of the index it covers
 def verify_surface_vocab(index_dir: str, scan: PostingsScan, cfg: "hw1.Config") -> Dict[str, float]:
     # every index term, for membership tests
@@ -860,22 +722,21 @@ def verify_surface_vocab(index_dir: str, scan: PostingsScan, cfg: "hw1.Config") 
 def run(index_dir: str = DEFAULT_INDEX_DIR, warc_path: Optional[str] = DEFAULT_WARC,
         log_base: float = DEFAULT_LOG_BASE, schemes: Sequence[str] = CHAMPION_SCHEMES,
         r: int = DEFAULT_CHAMPION_R, k1: float = DEFAULT_BM25_K1, b: float = DEFAULT_BM25_B,
-        verify: bool = True, seed: int = 27, surface: bool = True,
-        tier_sizes: Sequence[int] = DEFAULT_TIER_SIZES) -> dict:
+        verify: bool = True, seed: int = 27, surface: bool = True) -> dict:
     # HW1 postings file
     postings_path = os.path.join(index_dir, "postings.txt")
     # HW1 dictionary file
     dictionary_path = os.path.join(index_dir, "dictionary.txt")
+    # the submission ships postings.txt in packed form; restore it first when needed
+    import pack_index
+    # restore postings.txt from postings.delta.xz if only the packed form exists (progress goes to stdout)
+    pack_index.ensure_postings(index_dir, log=sys.stdout)
     # fail early with a clear message if the HW1 index is missing
     for p in (postings_path, dictionary_path):
         # required input
         if not os.path.exists(p):
             # explain what is missing
             raise FileNotFoundError(f"{p} not found; put HW1's dictionary.txt and postings.txt in {index_dir}")
-    # tier sizes must be positive and strictly increasing, otherwise some tier would always be empty
-    if any(t < 1 for t in tier_sizes) or any(a >= c for a, c in zip(tier_sizes, tier_sizes[1:])):
-        # explain the rule
-        raise ValueError(f"tier sizes must be positive and strictly increasing, got {list(tier_sizes)}")
 
     # step 1: N and TREC-IDs from the WARC
     warc_docs = None
@@ -886,18 +747,18 @@ def run(index_dir: str = DEFAULT_INDEX_DIR, warc_path: Optional[str] = DEFAULT_W
         # number every response record
         warc_docs = scan_warc_doc_ids(warc_path)
         # report
-        print(f"[1/7] WARC: {len(warc_docs):,} response records ({time.time() - t0:.1f}s)")
+        print(f"[1/6] WARC: {len(warc_docs):,} response records ({time.time() - t0:.1f}s)")
     # no WARC given
     else:
         # explain the fallback
-        print("[1/7] WARC not found, skipped; N falls back to the largest doc_id in postings.txt")
+        print("[1/6] WARC not found, skipped; N falls back to the largest doc_id in postings.txt")
 
     # step 2: pass 1 over postings
     t0 = time.time()
     # offsets, norm sums, lengths
     scan = scan_postings(postings_path, log_base)
     # report
-    print(f"[2/7] postings pass 1: {len(scan.term_entries):,} terms, {scan.num_postings:,} postings "
+    print(f"[2/6] postings pass 1: {len(scan.term_entries):,} terms, {scan.num_postings:,} postings "
           f"({time.time() - t0:.1f}s)")
 
     # step 3: N, norms, avgdl, tables
@@ -909,7 +770,7 @@ def run(index_dir: str = DEFAULT_INDEX_DIR, warc_path: Optional[str] = DEFAULT_W
     # write offsets / norms / lengths / doc_ids
     write_tables(index_dir, scan, doc_norms, warc_docs)
     # report
-    print(f"[3/7] N = {n:,} ({n_source}), avgdl = {avgdl:.2f}; tables written")
+    print(f"[3/6] N = {n:,} ({n_source}), avgdl = {avgdl:.2f}; tables written")
 
     # step 4: pass 2, champion lists
     t0 = time.time()
@@ -917,35 +778,24 @@ def run(index_dir: str = DEFAULT_INDEX_DIR, warc_path: Optional[str] = DEFAULT_W
     counts = write_champions(postings_path, index_dir, schemes, r, doc_norms, scan.doc_lengths, n, avgdl,
                              k1, b, log_base)
     # report
-    print(f"[4/7] champion lists (r={r}): " + ", ".join(f"{s} {counts[s]:,} ids" for s in schemes)
+    print(f"[4/6] champion lists (r={r}): " + ", ".join(f"{s} {counts[s]:,} ids" for s in schemes)
           + f" ({time.time() - t0:.1f}s)")
 
-    # step 5: pass 3, tiered index
-    t0 = time.time()
-    # one file per scheme, same orderings as the champion lists
-    tier_counts = write_tiers(postings_path, index_dir, schemes, tier_sizes, doc_norms, scan.doc_lengths, n, avgdl,
-                              k1, b, log_base)
-    # report
-    print(f"[5/7] tiered index (sizes {list(tier_sizes)}): "
-          + ("; ".join(f"{s} " + ", ".join(f"tier {i + 1} {c:,} ids" for i, c in enumerate(cs))
-                       for s, cs in tier_counts.items()) or "skipped")
-          + f" ({time.time() - t0:.1f}s)")
-
-    # step 6: surface vocabulary (needs the WARC; the slowest step because every page is parsed again)
+    # step 5: surface vocabulary (needs the WARC; the slowest step because every page is parsed again)
     t0 = time.time()
     # build it, or keep the description of an existing file
     surface_info = surface_step(index_dir, warc_path if warc_docs is not None else None, scan, surface)
     # report
-    print(f"[6/7] surface vocabulary: " + (f"{surface_info['pairs']:,} surface forms" if surface_info else "none")
+    print(f"[5/6] surface vocabulary: " + (f"{surface_info['pairs']:,} surface forms" if surface_info else "none")
           + f" ({time.time() - t0:.1f}s)")
 
-    # step 7: meta.json last, so it always matches the files next to it
+    # step 6: meta.json last, so it always matches the files next to it
     meta = build_meta(scan, doc_norms, n, n_source, max_doc_id, avgdl, log_base, warc_docs is not None,
-                      schemes, r, k1, b, surface_info, tier_sizes)
+                      schemes, r, k1, b, surface_info)
     # write it
     write_meta(index_dir, meta)
     # report
-    print("[7/7] meta.json written")
+    print("[6/6] meta.json written")
 
     # optional verification
     if verify:
@@ -966,13 +816,6 @@ def run(index_dir: str = DEFAULT_INDEX_DIR, warc_path: Optional[str] = DEFAULT_W
                                        n, avgdl, k1, b, 300, rng, log_base)
             # report
             print(f"verify: champion lists of {checked} sampled terms match a full sort ({', '.join(schemes)})")
-        # tiered index, when built
-        if tier_sizes and schemes:
-            # rebuild sampled tiers by full sort
-            checked = verify_tiers(postings_path, index_dir, scan, schemes, tier_sizes, doc_norms, scan.doc_lengths,
-                                   n, avgdl, k1, b, 300, rng, log_base)
-            # report
-            print(f"verify: tiers of {checked} sampled terms match a full sort ({', '.join(schemes)})")
         # surface vocabulary, when present
         if surface_info is not None:
             # structure, mapping and coverage
@@ -996,19 +839,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--no-warc", action="store_true", help="do not read the WARC even if it exists")
     # log base
     ap.add_argument("--log-base", type=float, default=DEFAULT_LOG_BASE, help="log base of tf weight and idf (default: 10)")
-    # champion list / tier orderings
+    # champion orderings
     ap.add_argument("--champion-schemes", nargs="*", choices=CHAMPION_SCHEMES, default=list(CHAMPION_SCHEMES),
-                    help="orderings of the champion lists and tiers to build (default: cosine bm25; give none to skip)")
+                    help="champion lists to build (default: cosine bm25; give none to skip)")
     # champion list length
     ap.add_argument("--champion-r", type=int, default=DEFAULT_CHAMPION_R, help="documents per champion list (default: 50)")
     # BM25 k1
     ap.add_argument("--bm25-k1", type=float, default=DEFAULT_BM25_K1, help="BM25 k1 for the bm25 ordering (default: 1.2)")
     # BM25 b
     ap.add_argument("--bm25-b", type=float, default=DEFAULT_BM25_B, help="BM25 b for the bm25 ordering (default: 0.75)")
-    # tiered index rank boundaries
-    ap.add_argument("--tier-sizes", nargs="*", type=int, default=list(DEFAULT_TIER_SIZES),
-                    help="rank boundaries of the tiered index, built for every champion scheme "
-                         "(default: 20 200; give none to skip)")
     # skip the slow surface vocabulary step
     ap.add_argument("--no-surface", action="store_true",
                     help="do not rebuild surface_vocab.tsv (an existing one is kept); saves about 4 minutes")
@@ -1026,5 +865,4 @@ if __name__ == "__main__":
     base = int(args.log_base) if args.log_base == int(args.log_base) else args.log_base
     # whole pipeline
     run(args.index_dir, None if args.no_warc else args.warc, base, args.champion_schemes,
-        args.champion_r, args.bm25_k1, args.bm25_b, not args.no_verify, surface=not args.no_surface,
-        tier_sizes=args.tier_sizes)
+        args.champion_r, args.bm25_k1, args.bm25_b, not args.no_verify, surface=not args.no_surface)

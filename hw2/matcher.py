@@ -8,7 +8,9 @@ from index_reader import IndexReader
 # AST node types produced by query_parser
 from query_parser import And, Node, Not, Or, Phrase, Proximity, Query, Term, Wildcard
 # surface forms for wildcards on the original words
-from spell import SurfaceVocab
+from spell import SurfaceVocab, wildcard_regex
+# k-gram index for general wildcard patterns
+from kgram import KGramIndex
 
 
 # Boolean / positional evaluation of a query filter on top of an IndexReader
@@ -30,6 +32,12 @@ class Matcher:
         self._surface: Optional[SurfaceVocab] = None
         # True once surface_vocab.tsv was looked for
         self._surface_loaded = False
+        # k-gram index over index terms and surface forms (kgram.bin), opened on first use
+        self._kgram: Optional[KGramIndex] = None
+        # True once kgram.bin was looked for
+        self._kgram_loaded = False
+        # set to False to force the original dictionary scan (used to cross-check the k-gram path)
+        self.use_kgram = True
 
     # ------------------------------------------------------------------
     # public API
@@ -60,10 +68,31 @@ class Matcher:
         first_wild = min(i for i, c in enumerate(pattern) if c in "*?")
         # literal text before it; every match must start with this prefix
         prefix = pattern[:first_wild]
+        # candidates from the k-gram index for everything but a pure prefix pattern (None = not usable)
+        grams = self.kgram().candidates(pattern) if (pattern != prefix + "*" and self.kgram() is not None) else None
         # pure prefix pattern ("comput*"): the sorted vocabulary answers it directly
         if pattern == prefix + "*":
             # contiguous run of terms with this prefix
             terms = self.idx.terms_with_prefix(prefix)
+        # general pattern with the k-gram index (IIR 3.2.2): intersect the gram lists, then post-filter,
+        # because sharing every k-gram is necessary but not sufficient ("red*" also proposes "retired")
+        elif grams is not None:
+            # same regexes as the scan below, applied to the few candidates only
+            regex = re.compile("".join(".*" if c == "*" else "." if c == "?" else re.escape(c) for c in pattern))
+            # dictionary in sorted order: a term id is its position
+            all_terms = self.idx.all_terms()
+            # index terms that really match
+            matched = {all_terms[i] for i in grams[0] if regex.fullmatch(all_terms[i])}
+            # surface forms that really match contribute the term they were stemmed to
+            vocab = self.surface_vocab()
+            # surface-form regex (same rules as SurfaceVocab's wildcard matching)
+            s_regex = wildcard_regex(pattern)
+            # add the stemmed term of every surface candidate that really matches
+            matched.update(vocab.terms[k] for k in grams[1] if s_regex.fullmatch(vocab.surfaces[k]))
+            # remember and return; the surface forms are already included
+            self._wildcard_cache[pattern] = sorted(matched)
+            # sorted expansion
+            return self._wildcard_cache[pattern]
         # general pattern ("wom?n", "*ology", "c*t*r")
         else:
             # translate to a regex: * -> .*, ? -> ., everything else literal
@@ -93,6 +122,34 @@ class Matcher:
             self._surface_loaded = True
         # loaded vocabulary or None
         return self._surface
+
+    # kgram.bin, opened on first use (built then, about 3 seconds, when it is missing); None when switched off
+    def kgram(self) -> Optional[KGramIndex]:
+        # switched off (cross-checking the original scan)
+        if not self.use_kgram:
+            # callers fall back to the scan
+            return None
+        # first call
+        if not self._kgram_loaded:
+            # look only once
+            self._kgram_loaded = True
+            # surface vocabulary, part of the k-gram index's strings
+            vocab = self.surface_vocab()
+            # no surface vocabulary: index terms only
+            surfaces = vocab.surfaces if vocab is not None else []
+            # missing, or built for another index / surface vocabulary
+            if not KGramIndex.available(self.idx, len(surfaces)):
+                import sys
+                # k-gram builder
+                import kgram
+                # tell the user why this query is slower
+                print("# building the k-gram index (one time, a few seconds) ...", file=sys.stderr, flush=True)
+                # build kgram.bin / kgram.json
+                kgram.build(self.idx, surfaces)
+            # open it
+            self._kgram = KGramIndex(self.idx.index_dir)
+        # cached index
+        return self._kgram
 
     # ------------------------------------------------------------------
     # postings with per-query caching

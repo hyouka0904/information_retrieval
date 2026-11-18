@@ -3,7 +3,7 @@ import math
 import os
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 # index access layer
 from index_reader import IndexReader
@@ -11,19 +11,12 @@ from index_reader import IndexReader
 from matcher import Matcher
 # AST node types and the helper that lists ranking leaves
 from query_parser import Phrase, Proximity, Query, Term, Wildcard, positive_leaves
-
-# weighting schemes the ranker can score with
-SCHEMES = ("tfidf", "bm25")
-# champion scheme name in meta.json for each weighting scheme
-CHAMPION_SCHEME_OF = {"tfidf": "cosine", "bm25": "bm25"}
-# champion file used when meta.json has no champion section (older prep output)
-DEFAULT_CHAMPION_FILES = {"cosine": "champions.tsv", "bm25": "champions_bm25.tsv"}
-# BM25 tf saturation parameter used when neither the caller nor meta.json gives one
-DEFAULT_BM25_K1 = 1.2
-# BM25 length normalization parameter used when neither the caller nor meta.json gives one
-DEFAULT_BM25_B = 0.75
-# tiered index file used when meta.json does not name one
-DEFAULT_TIER_FILES = {"cosine": "tiers.tsv", "bm25": "tiers_bm25.tsv"}
+# weighting schemes (SMART variants, BM25); the default is the Slide 4 formula
+from weighting import Scheme
+# postings grouped by tf, for --impact / --tiered / --tf-index
+from tf_index import TfIndex, block_pairs
+# cluster pruning
+from clusters import Clusters
 
 
 # result of Ranker.rank()
@@ -39,34 +32,28 @@ class RankResult:
     terms_dropped: List[str] = field(default_factory=list)
     # True when champion lists gave fewer than top_k documents and the full candidate set was used instead
     champions_fallback: bool = False
-    # tiered index: how many tiers were read before top_k documents were found (None = tiers not used)
-    tiers_used: Optional[int] = None
-    # tiered index: total number of tiers, the bottom one being "all postings" (None = tiers not used)
-    tiers_total: Optional[int] = None
+    # remarks for the user (fallbacks, tiers read, early termination), shown with -v
+    notes: List[str] = field(default_factory=list)
+    # number of postings that were scored (a machine-independent cost measure)
+    postings_scored: int = 0
 
 
-# TF-IDF + cosine or BM25 ranking over an IndexReader, with a Matcher for the query filter
+# TF-IDF + cosine ranking over an IndexReader, with a Matcher for the query filter
 class Ranker:
 
-    # wildcard_limit caps how many expansions of one wildcard take part in scoring; k1 / b default to meta.json
+    # wildcard_limit caps how many expansions of one wildcard take part in scoring
     def __init__(self, idx: IndexReader, matcher: Optional[Matcher] = None, wildcard_limit: int = 30,
-                 scheme: str = "tfidf", k1: Optional[float] = None, b: Optional[float] = None):
-        # only the listed weighting schemes exist
-        if scheme not in SCHEMES:
-            # reject typos early
-            raise ValueError(f"unknown weighting scheme {scheme!r}; choose one of {SCHEMES}")
+                 scheme: Optional[Scheme] = None):
+        # weighting scheme; None means ltc.ltc, the formula of Slide 4
+        self.scheme = scheme if scheme is not None else Scheme(idx)
+        # tf-ordered postings, opened on first use
+        self._tfi: Optional[TfIndex] = None
+        # cluster pruning tables, loaded on first use
+        self._clusters: Optional[Clusters] = None
+        # 1 / ||d|| by doc_id, built on first use by --impact
+        self._inv_norm: Optional[List[float]] = None
         # index access
         self.idx = idx
-        # "tfidf" (Slide 4, cosine) or "bm25"
-        self.scheme = scheme
-        # BM25 parameters the champion lists were built with (empty when prep.py did not build them)
-        built = idx.meta.get("champions", {}).get("schemes", {}).get("bm25", {})
-        # k1: caller, then meta.json, then the textbook default
-        self.k1 = float(k1 if k1 is not None else built.get("k1", DEFAULT_BM25_K1))
-        # b: caller, then meta.json, then the textbook default
-        self.b = float(b if b is not None else built.get("b", DEFAULT_BM25_B))
-        # doc_id -> k1 * (1 - b + b * |d| / avgdl), built on the first BM25 query
-        self._bm25_k: Optional[List[float]] = None
         # Boolean / positional filter evaluation (shares the wildcard cache)
         self.matcher = matcher if matcher is not None else Matcher(idx)
         # a wildcard adds at most this many expanded terms to the score (the most frequent ones)
@@ -75,10 +62,6 @@ class Ranker:
         self._champions: Optional[Dict[str, str]] = None
         # term -> parsed champion doc_ids, filled only for terms that were actually queried
         self._champion_sets: Dict[str, Set[int]] = {}
-        # term -> raw "tier-1 docs<TAB>tier-2 docs ..." text of the tiers file, loaded on first use
-        self._tiers: Optional[Dict[str, str]] = None
-        # (term, level) -> doc_ids in tiers 0..level of the term, filled only for queried terms
-        self._tier_sets: Dict[tuple, Set[int]] = {}
 
     # ------------------------------------------------------------------
     # weights
@@ -93,61 +76,6 @@ class Ranker:
     def query_weight(self, qtf: int, idf: float) -> float:
         # the same formula on the query side
         return self.idx.tf_weight(qtf) * idf
-
-    # BM25 idf ln(1 + (N - df + 0.5) / (df + 0.5)); never negative, unlike the plain Robertson-Sparck Jones form
-    def bm25_idf(self, term: str) -> float:
-        # document frequency of the term
-        df = self.idx.df(term)
-        # a term absent from the index contributes nothing
-        if df == 0:
-            # no weight
-            return 0.0
-        # Lucene-style smoothed idf
-        return math.log(1.0 + (self.idx.N - df + 0.5) / (df + 0.5))
-
-    # doc_id -> k1 * (1 - b + b * |d| / avgdl), read from doc_lengths.tsv once per process
-    def bm25_denominators(self) -> List[float]:
-        # already built
-        if self._bm25_k is not None:
-            # reuse
-            return self._bm25_k
-        # average document length written by prep.py
-        avgdl = self.idx.meta.get("avgdl")
-        # document lengths written by prep.py
-        path = os.path.join(self.idx.index_dir, "doc_lengths.tsv")
-        # BM25 statistics were never built
-        if not avgdl or not os.path.exists(path):
-            # tell the user how to create them
-            raise FileNotFoundError(f"{path} or meta.json 'avgdl' missing; build them with 'python prep.py' first")
-        # documents missing from the file have length 0, i.e. k1 * (1 - b)
-        table = [self.k1 * (1.0 - self.b)] * (self.idx.N + 1)
-        # LF-only line splitting, matching how the file was written
-        with open(path, encoding="utf-8", newline="\n") as f:
-            # one "doc_id<TAB>length" per line
-            for line in f:
-                # split into the two fields
-                d_s, len_s = line.rstrip("\n").split("\t")
-                # length-normalized saturation constant of this document
-                table[int(d_s)] = self.k1 * (1.0 - self.b + self.b * int(len_s) / avgdl)
-        # cache for later queries
-        self._bm25_k = table
-        # finished table
-        return table
-
-    # True when the BM25 champion lists ("champions") or tiers ("tiers") were built with other k1 / b than scoring uses
-    def champion_params_differ(self, section: str = "champions") -> bool:
-        # only BM25 orderings depend on k1 / b
-        if self.scheme != "bm25":
-            # cosine orderings have no parameters
-            return False
-        # parameters recorded by prep.py
-        built = (self.idx.meta.get(section) or {}).get("schemes", {}).get("bm25")
-        # nothing recorded: cannot tell, so do not warn
-        if not built:
-            # no warning
-            return False
-        # compare with a tolerance for float round-off
-        return abs(built["k1"] - self.k1) > 1e-9 or abs(built["b"] - self.b) > 1e-9
 
     # ------------------------------------------------------------------
     # query terms
@@ -192,19 +120,14 @@ class Ranker:
     # champion lists
     # ------------------------------------------------------------------
 
-    # term -> raw id list of the champion file of the current scheme, read once per process
+    # term -> raw id list of champions.tsv, read once per process
     def _load_champions(self) -> Dict[str, str]:
         # already loaded
         if self._champions is not None:
             # reuse
             return self._champions
-        # champion ordering that matches the weighting scheme
-        champ_scheme = CHAMPION_SCHEME_OF[self.scheme]
-        # file name recorded by prep.py, or the default name
-        name = self.idx.meta.get("champions", {}).get("schemes", {}).get(champ_scheme, {}).get(
-            "file", DEFAULT_CHAMPION_FILES[champ_scheme])
-        # champion lists written by prep.py / the prep notebook
-        path = os.path.join(self.idx.index_dir, name)
+        # champion lists written by prep.py: ordered by cosine contribution, or by the BM25 tf part for --scheme bm25
+        path = os.path.join(self.idx.index_dir, "champions_bm25.tsv" if self.scheme.is_bm25 else "champions.tsv")
         # champion lists were never built
         if not os.path.exists(path):
             # tell the user how to create them
@@ -236,80 +159,43 @@ class Ranker:
         return self._champion_sets[term]
 
     # ------------------------------------------------------------------
-    # tiered index
+    # lazily opened structures of the inexact top-k methods
     # ------------------------------------------------------------------
 
-    # number of stored tiers (one per rank boundary in meta.json); the implicit bottom tier is not counted
-    def stored_tiers(self) -> int:
-        # tiered index description written by prep.py
-        info = self.idx.meta.get("tiers")
-        # never built
-        if not info:
-            # tell the user how to create it
-            raise FileNotFoundError("meta.json has no tiered index; build it with 'python prep.py' first")
-        # one stored tier per rank boundary
-        return len(info["sizes"])
+    # tf-ordered postings (built on first use when missing)
+    def tf_index(self) -> TfIndex:
+        # open on first use
+        if self._tfi is None:
+            # builds the files first when they are missing or stale
+            self._tfi = TfIndex.open(self.idx)
+        # cached handle
+        return self._tfi
 
-    # term -> raw tier text of the tiers file of the current scheme, read once per process
-    def _load_tiers(self) -> Dict[str, str]:
-        # already loaded
-        if self._tiers is not None:
-            # reuse
-            return self._tiers
-        # tier ordering that matches the weighting scheme (the same as the champion ordering)
-        tier_scheme = CHAMPION_SCHEME_OF[self.scheme]
-        # file name recorded by prep.py, or the default name
-        name = (self.idx.meta.get("tiers") or {}).get("schemes", {}).get(tier_scheme, {}).get(
-            "file", DEFAULT_TIER_FILES[tier_scheme])
-        # tiered index written by prep.py / the prep notebook
-        path = os.path.join(self.idx.index_dir, name)
-        # tiered index was never built
-        if not os.path.exists(path):
-            # tell the user how to create it
-            raise FileNotFoundError(f"{path} not found; build it with 'python prep.py' first")
-        # term -> unparsed tier fields
-        tiers: Dict[str, str] = {}
-        # LF-only line splitting, matching how the file was written
-        with open(path, encoding="utf-8", newline="\n") as f:
-            # one "term<TAB>tier-1 docs<TAB>tier-2 docs ..." per line
-            for line in f:
-                # split term from the tier fields
-                term, rest = line.rstrip("\n").split("\t", 1)
-                # keep the text, parsed later on demand
-                tiers[term] = rest
-        # cache for later queries
-        self._tiers = tiers
-        # loaded table
-        return tiers
-
-    # doc_ids of a processed term in stored tiers 0..level (cumulative, 0-based); a term absent from the file has none
-    def tier_docs(self, term: str, level: int) -> Set[int]:
-        # cache key
-        key = (term, level)
-        # parsed before
-        if key not in self._tier_sets:
-            # raw tier fields of the term ("" for a term not in the index)
-            raw = self._load_tiers().get(term, "")
-            # one field per stored tier
-            fields = raw.split("\t") if raw else []
-            # union of the fields up to and including this level
-            self._tier_sets[key] = {int(x) for fld in fields[: level + 1] for x in fld.split()}
-        # cached set
-        return self._tier_sets[key]
+    # cluster pruning tables
+    def clusters(self) -> Clusters:
+        # load on first use
+        if self._clusters is None:
+            # cluster files are not built automatically (they need a full pass over the collection)
+            if not Clusters.available(self.idx):
+                # tell the user how to build them
+                raise FileNotFoundError("cluster files not found; build them with 'python prep_extra.py' first")
+            # load leaders and followers
+            self._clusters = Clusters(self.idx)
+        # cached tables
+        return self._clusters
 
     # ------------------------------------------------------------------
     # ranking
     # ------------------------------------------------------------------
 
-    # rank documents for a parsed query; top_k <= 0 returns every candidate (see README for the options);
-    # _tier_level is internal: the tier the tiered search has reached
+    # rank documents for a parsed query; top_k <= 0 returns every candidate (see README for the options)
     def rank(self, query: Query, top_k: int = 10, idf_threshold: Optional[float] = None,
-             min_match: int = 1, champions: bool = False, tiered: bool = False,
-             _tier_level: int = 0) -> RankResult:
-        # both restrict the candidate set in different ways; combining them has no textbook meaning
-        if champions and tiered:
-            # reject the combination
-            raise ValueError("champion lists and the tiered index cannot be used together")
+             min_match: int = 1, champions: bool = False, tiered: bool = False, impact: bool = False,
+             cluster: Optional[Tuple[int, int]] = None, tf_index: bool = False) -> RankResult:
+        # weighting scheme of this ranker
+        sch = self.scheme
+        # remarks collected for -v
+        notes: List[str] = []
         # sorted doc_ids from the filter, or None for plain free text
         filtered = self.matcher.match(query)
         # query term frequencies
@@ -321,13 +207,9 @@ class Ranker:
         dropped = [t for t in qtf if idf[t] == 0.0]
         # remaining terms
         kept = [t for t in qtf if idf[t] > 0.0]
-        # BM25 scoring instead of cosine
-        bm25 = self.scheme == "bm25"
-        # query vector length over every term present in the index (before elimination, so scores stay
-        # comparable whether or not elimination is switched on); BM25 does not normalize
-        q_norm = 0.0 if bm25 else math.sqrt(sum(self.query_weight(qtf[t], idf[t]) ** 2 for t in kept))
-        # doc_id -> k1 * (1 - b + b * |d| / avgdl), only needed for BM25
-        bm25_k = self.bm25_denominators() if bm25 else None
+        # query weights and query vector length over every term present in the index (before elimination,
+        # so scores stay comparable whether or not elimination is switched on)
+        wq, q_norm = sch.query_weights({t: qtf[t] for t in kept})
 
         # index elimination by idf
         if idf_threshold is not None and kept:
@@ -342,72 +224,120 @@ class Ranker:
             # continue with the surviving terms
             kept = high
 
-        # restriction to champion / tier documents (None = no restriction)
-        restrict: Optional[Set[int]] = None
+        # restriction to a precomputed candidate set (None = no restriction)
+        champ_docs: Optional[Set[int]] = None
         # champion lists requested
         if champions and kept:
             # union of the champion lists of the surviving terms
-            restrict = set().union(*(self.champion_docs(t) for t in kept))
-        # number of stored tiers (0 when the tiered index is not used)
-        levels = self.stored_tiers() if tiered and kept else 0
-        # tiered index requested and the search has not yet fallen through to the bottom tier
-        if tiered and kept and _tier_level < levels:
-            # union of tiers 0.._tier_level of the surviving terms
-            restrict = set().union(*(self.tier_docs(t, _tier_level) for t in kept))
+            champ_docs = set().union(*(self.champion_docs(t) for t in kept))
+            # the BM25 lists were ordered with fixed parameters
+            bm = self.idx.meta.get("champions", {}).get("schemes", {}).get("bm25", {})
+            # BM25 scoring with other parameters than the lists were ordered with
+            if sch.is_bm25 and (bm.get("k1"), bm.get("b")) != (sch.k1, sch.b):
+                # still usable; tell the user under -v
+                notes.append(f"champion lists were built with k1={bm.get('k1')}, b={bm.get('b')}, "
+                             f"not k1={sch.k1}, b={sch.b}")
+        # cluster pruning requested: followers of the leaders nearest to the query
+        if cluster is not None and kept:
+            # followers of the b2 leaders nearest to the query
+            cl_docs = self.clusters().candidates({t: qtf[t] for t in kept}, cluster[0], cluster[1])
+            # both restrictions together mean their intersection
+            champ_docs = cl_docs if champ_docs is None else champ_docs & cl_docs
 
         # set version of the filter result for O(1) membership tests
         allowed: Optional[Set[int]] = set(filtered) if filtered is not None else None
-        # champion / tier restriction applies on top of the filter
-        if restrict is not None:
+        # the restriction applies on top of the filter
+        if champ_docs is not None:
             # intersect with the filter, or use the restriction alone
-            allowed = restrict if allowed is None else allowed & restrict
+            allowed = champ_docs if allowed is None else allowed & champ_docs
 
-        # doc_id -> accumulated dot product
-        acc: Dict[int, float] = {}
-        # doc_id -> number of query terms it contains (for min_match)
-        hits_per_doc: Counter = Counter()
-        # BM25 saturation numerator factor
-        k1p1 = self.k1 + 1.0
-        # term-at-a-time accumulation
-        for t in kept:
-            # query-side weight: tf-idf for cosine, query tf times BM25 idf for BM25
-            wq = qtf[t] * self.bm25_idf(t) if bm25 else self.query_weight(qtf[t], idf[t])
-            # walk the term's postings
-            for d, tf in self.idx.get_doc_tfs(t):
-                # skip documents outside the filter / champion set
-                if allowed is not None and d not in allowed:
-                    # next posting
-                    continue
-                # BM25 term contribution
-                if bm25:
-                    # add qtf * idf * tf (k1 + 1) / (tf + k1 (1 - b + b |d| / avgdl))
-                    acc[d] = acc.get(d, 0.0) + wq * tf * k1p1 / (tf + bm25_k[d])
-                # TF-IDF dot product
-                else:
-                    # add w(t, q) * w(t, d)
-                    acc[d] = acc.get(d, 0.0) + wq * self.doc_weight(tf, idf[t])
-                # one more query term found in this document
-                hits_per_doc[d] += 1
+        # tiered index: read tier 1 of every term, go one tier down only while fewer than top_k documents were found
+        tier_limited = False
+        # tiered search needs query terms and a finite k
+        if tiered and kept and top_k > 0:
+            # tf-ordered postings with the tier thresholds
+            tfi = self.tf_index()
+            # documents collected from the tiers read so far
+            found: Set[int] = set()
+            # every term's blocks, read once
+            blocks = {t: tfi.blocks(t) for t in kept}
+            # tiers from best to worst
+            for tier in range(tfi.num_tiers):
+                # every surviving query term
+                for t in kept:
+                    # doc arrays of this term in this tier
+                    for docs in tfi.tier_docs(t, tier, blocks[t]):
+                        # add them, restricted to the filter when there is one
+                        found.update(docs if allowed is None else allowed.intersection(docs))
+                # enough documents: stop going down
+                if len(found) >= top_k:
+                    # leave the tier loop
+                    break
+            # report how deep the search went
+            notes.append(f"tiered index: read {tier + 1} of {tfi.num_tiers} tiers, {len(found):,} documents")
+            # all tiers read means every posting was seen: nothing is pruned
+            if tier + 1 < tfi.num_tiers:
+                # score only the documents found in the tiers that were read
+                allowed, tier_limited = found, True
 
         # min_match only applies to free text (Boolean results are already exact)
-        if query.mode == "free" and min_match > 1 and kept:
-            # cannot demand more terms than the query has
-            need = min(min_match, len(kept))
-            # keep documents containing enough query terms
-            acc = {d: s for d, s in acc.items() if hits_per_doc[d] >= need}
-
-        # doc_id -> final score
+        use_min_match = query.mode == "free" and min_match > 1 and bool(kept)
+        # number of postings scored
+        scored = 0
+        # doc_id -> similarity
         scores: Dict[int, float] = {}
-        # BM25 sums are already the final scores
-        if bm25:
-            # no length normalization afterwards
-            scores = dict(acc)
-        # cosine
+        # impact ordering: tf-ordered postings, max-score bounds, early termination
+        if impact and kept:
+            # final scores and postings scored
+            scores, scored = self._accumulate_impact(kept, wq, q_norm, allowed, top_k, use_min_match, min_match, notes)
+        # exact term-at-a-time scoring
         else:
+            # doc_id -> accumulated dot product
+            acc: Dict[int, float] = {}
+            # doc_id -> number of query terms it contains (for min_match)
+            hits_per_doc: Counter = Counter()
+            # postings come from the tf index when one of its users is switched on, else from postings.txt
+            use_tfi = tf_index or tiered or cluster is not None
+            # term-at-a-time accumulation
+            for t in kept:
+                # query-side weight of the term
+                wq_t = wq[t]
+                # document-side weight function of the term
+                wd = sch.doc_weight_fn(t)
+                # postings of the term, already restricted when they come from the tf index
+                if use_tfi:
+                    # (doc_id, tf) from tf_index.bin, restricted to `allowed`
+                    pairs = self.tf_index().doc_tfs(t, allowed)
+                # default source
+                else:
+                    # (doc_id, tf) parsed from postings.txt
+                    pairs = self.idx.get_doc_tfs(t)
+                # walk the term's postings
+                for d, tf in pairs:
+                    # skip documents outside the filter / candidate set
+                    if allowed is not None and d not in allowed:
+                        # next posting
+                        continue
+                    # add w(t, q) * w(t, d)
+                    acc[d] = acc.get(d, 0.0) + wq_t * wd(d, tf)
+                    # one more query term found in this document
+                    hits_per_doc[d] += 1
+                    # count the posting
+                    scored += 1
+
+            # keep documents containing enough query terms
+            if use_min_match:
+                # cannot demand more terms than the query has
+                need = min(min_match, len(kept))
+                # drop documents with fewer matching terms
+                acc = {d: s for d, s in acc.items() if hits_per_doc[d] >= need}
+
+            # document vector lengths under this scheme (all 1 without cosine normalization)
+            d_norms = sch.doc_norms()
             # normalize every accumulator
             for d, dot in acc.items():
                 # document vector length
-                d_norm = self.idx.doc_norms[d]
+                d_norm = d_norms[d]
                 # zero-length vectors cannot be normalized
                 if d_norm > 0.0 and q_norm > 0.0:
                     # cosine similarity
@@ -415,22 +345,28 @@ class Ranker:
 
         # filtered queries keep matching documents that scored 0 (e.g. "NOT x", or docs matched only via OR NOT)
         if filtered is not None:
-            # every filtered document that survived the champion / tier restriction
-            for d in (filtered if restrict is None else (x for x in filtered if x in restrict)):
+            # every filtered document that survived the restriction
+            keep = allowed if (champ_docs is not None or tier_limited) else None
+            # filtered documents, restricted when a candidate restriction is active
+            for d in (filtered if keep is None else (x for x in filtered if x in keep)):
                 # documents without any accumulated score get 0
                 scores.setdefault(d, 0.0)
 
-        # tiers read so far left too few documents: go one tier lower (the last step uses every posting)
-        if tiered and restrict is not None and top_k > 0 and len(scores) < top_k:
-            # same query, one more tier
-            return self.rank(query, top_k, idf_threshold, min_match, tiered=True, _tier_level=_tier_level + 1)
-
-        # champion lists left too few documents (typical for AND / phrase filters): textbook fallback to the full set
-        if restrict is not None and top_k > 0 and len(scores) < top_k:
-            # same query without the champion restriction
-            full = self.rank(query, top_k, idf_threshold, min_match, champions=False)
+        # the restriction left too few documents (typical for AND / phrase filters): textbook fallback
+        if (champ_docs is not None or tier_limited) and top_k > 0 and len(scores) < top_k:
+            # cluster pruning first widens the search: twice as many leaders, until all of them are used
+            if cluster is not None and cluster[1] < len(self.clusters().leaders):
+                # same query with b2 doubled
+                full = self.rank(query, top_k, idf_threshold, min_match, champions, tiered, impact,
+                                 (cluster[0], cluster[1] * 2), tf_index)
+            # otherwise the same query without any restriction
+            else:
+                # exact search (impact ordering stays on: it is exact)
+                full = self.rank(query, top_k, idf_threshold, min_match, False, False, impact, None, tf_index)
             # mark the result so the caller can report it
             full.champions_fallback = True
+            # postings scored by the failed attempt were work too
+            full.postings_scored += scored
             # exact candidates instead
             return full
 
@@ -441,13 +377,137 @@ class Ranker:
         # bounded top-k with a heap, or a full sort
         best = heapq.nlargest(top_k, scores.items(), key=key) if top_k > 0 else sorted(scores.items(), key=key, reverse=True)
         # ranked result
-        res = RankResult(best, num_candidates, {t: qtf[t] for t in kept}, dropped)
-        # tiered search: report how deep it went (the bottom tier counts as one more)
-        if tiered and kept:
-            # tiers read, out of the stored ones plus the bottom tier
-            res.tiers_used, res.tiers_total = min(_tier_level, levels) + 1, levels + 1
-        # finished
-        return res
+        return RankResult(best, num_candidates, {t: qtf[t] for t in kept}, dropped, notes=notes, postings_scored=scored)
+
+    # Impact-ordered scoring (IIR 7.1.5 with a safe stopping rule). Terms are processed in decreasing order of the
+    # largest contribution they can make, their postings in decreasing tf. Once the k-th best score so far exceeds
+    # everything a not yet seen document could still collect, no new accumulators are created: the remaining
+    # postings are only looked up for the surviving documents. Returns (doc_id -> final score, postings scored).
+    def _accumulate_impact(self, kept: List[str], wq: Dict[str, float], q_norm: float, allowed: Optional[Set[int]],
+                           top_k: int, use_min_match: bool, min_match: int, notes: List[str]):
+        # weighting scheme of this ranker
+        sch = self.scheme
+        # tf-ordered postings with the stored bounds
+        tfi = self.tf_index()
+        # which stored bound fits the scheme ("ltc", "bm25" or None)
+        kind = sch.bound_kind(tfi.meta)
+        # vector lengths of the scheme
+        d_norms = sch.doc_norms()
+        # 1 / ||d||, so a posting costs one multiplication
+        if self._inv_norm is None or len(self._inv_norm) != len(d_norms):
+            # reciprocal of every length (0 for empty documents), cached on the ranker
+            self._inv_norm = [1.0 / v if v > 0.0 else 0.0 for v in d_norms]
+        # local name for speed
+        inv_norm = self._inv_norm
+        # query normalization folded into every contribution
+        inv_q = 1.0 / q_norm if q_norm > 0.0 else 0.0
+        # early termination needs a bound, a finite k and no min_match (which changes who may enter the top k)
+        safe = kind is not None and top_k > 0 and not use_min_match
+        # early termination not possible
+        if not safe:
+            # explain under -v why no early termination happens
+            notes.append("impact ordering: no early termination ("
+                         + ("no stored bound for this scheme" if kind is None else "top-k = all or min-match") + ")")
+        # per term: largest possible contribution, weight function, blocks, per-block bound factor
+        recs = []
+        # every surviving query term
+        for t in kept:
+            # its tf blocks, highest tf first
+            blocks = tfi.blocks(t)
+            # term without postings
+            if not blocks:
+                # nothing to score
+                continue
+            # cosine bound
+            if kind == "ltc":
+                # contribution = wq * idf * (1 + log tf) / (|q| |d|); the stored bound covers (1 + log tf) / |d|
+                factor = wq[t] * sch.idf(t, "t") * inv_q
+            # BM25 bound
+            elif kind == "bm25":
+                # contribution = qtf * idf * tf part; the stored bound covers the tf part
+                factor = wq[t] * sch.bm25_idf(t)
+            # no usable bound: early termination is off anyway
+            else:
+                # bounds are not used
+                factor = 0.0
+            # bound of every block (suffix maxima, so bounds[0] is the term's largest possible contribution)
+            bounds = [factor * (b.bound_ltc if kind == "ltc" else b.bound_bm25) for b in blocks]
+            # one record per term
+            recs.append((bounds[0], t, blocks, bounds))
+        # the term that can contribute most goes first (highest idf first, for equal query tf)
+        recs.sort(key=lambda r: -r[0])
+        # rest[i] = most a document can collect from terms i, i+1, ...
+        rest = [0.0] * (len(recs) + 1)
+        # from the last term backwards
+        for i in range(len(recs) - 1, -1, -1):
+            # suffix sum of the per-term maxima
+            rest[i] = rest[i + 1] + recs[i][0]
+
+        # doc_id -> score so far (already normalized)
+        acc: Dict[int, float] = {}
+        # doc_id -> number of query terms seen (for min_match)
+        hits: Counter = Counter()
+        # postings scored
+        scored = 0
+        # False while new documents may still enter the top k
+        closed = False
+        # (term position, tf) where the search closed, for the -v note
+        closed_at = None
+        # terms in decreasing order of their largest contribution
+        for i, (_, t, blocks, bounds) in enumerate(recs):
+            # document-side weight function of the term
+            wd = sch.doc_weight_fn(t)
+            # query weight divided by the query length
+            c = wq[t] * inv_q
+            # after closing: drop accumulators that cannot reach the current k-th score any more
+            if closed and len(acc) > top_k:
+                # current k-th best score
+                theta = heapq.nlargest(top_k, acc.values())[-1]
+                # keep documents that could still reach it with the remaining terms
+                acc = {d: s for d, s in acc.items() if s + rest[i] >= theta}
+            # blocks of the term, highest tf first
+            for blk, bound in zip(blocks, bounds):
+                # test the stopping rule before every large block (small blocks are cheaper to score than to test)
+                if safe and not closed and len(acc) >= top_k and len(blk.docs) >= 256:
+                    # current k-th best score
+                    theta = heapq.nlargest(top_k, acc.values())[-1]
+                    # a document not seen so far can collect at most bound + rest[i + 1]
+                    if theta > bound + rest[i + 1]:
+                        # no new document can enter the top k from here on
+                        closed, closed_at = True, (i, blk.tf)
+                # closed: update existing accumulators only
+                if closed:
+                    # only documents that already have an accumulator
+                    for d, tf in block_pairs(blk, acc):
+                        # add the normalized contribution
+                        acc[d] += c * wd(d, tf) * inv_norm[d]
+                        # count the posting
+                        scored += 1
+                # still open: every allowed document of the block
+                else:
+                    # documents of the block, restricted to the filter / candidate set
+                    for d, tf in block_pairs(blk, allowed):
+                        # add the normalized contribution, creating the accumulator if needed
+                        acc[d] = acc.get(d, 0.0) + c * wd(d, tf) * inv_norm[d]
+                        # count the posting
+                        scored += 1
+                        # min_match needs the number of matching terms
+                        if use_min_match:
+                            # one more query term in this document
+                            hits[d] += 1
+        # report where the search closed
+        if closed_at is not None:
+            # term number, term, tf limit and accumulators left
+            notes.append(f"impact ordering: no new documents after term {closed_at[0] + 1} of {len(recs)} "
+                         f"({recs[closed_at[0]][1]!r}, tf < {closed_at[1] + 1}); {len(acc):,} accumulators left")
+        # keep documents containing enough query terms
+        if use_min_match:
+            # cannot demand more terms than the query has
+            need = min(min_match, len(kept))
+            # drop documents with fewer matching terms
+            acc = {d: s for d, s in acc.items() if hits[d] >= need}
+        # documents with a zero-length vector cannot be ranked (same rule as the exact path)
+        return {d: s for d, s in acc.items() if inv_norm[d] > 0.0 and inv_q > 0.0}, scored
 
 
 # demo: python ranker.py [query ...]

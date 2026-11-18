@@ -9,10 +9,12 @@ from typing import List, Optional, TextIO, Tuple
 from index_reader import IndexReader
 # query string -> AST, and its error type
 from query_parser import QuerySyntaxError, parse_query
-# TF-IDF + cosine / BM25 ranking, and the scheme names it accepts
-from ranker import SCHEMES, Ranker
+# TF-IDF + cosine ranking
+from ranker import Ranker
 # spelling correction on the raw query
 from spell import SpellCorrector
+# weighting schemes (SMART variants, BM25)
+from weighting import DEFAULT_B, DEFAULT_K1, DEFAULT_SCHEME, HELP as SCHEME_HELP, Scheme, SchemeError
 
 # text shown by --help (the full explanation is in README.md)
 HELP_TEXT = """HW2 command-line search: prints "<doc#> <TAB> <similarity score>" lines (Slide 5).
@@ -50,28 +52,35 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # extra diagnostics
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="also print the parsed query, candidate count, dropped terms and time")
-    # term weighting scheme
-    ap.add_argument("-w", "--weighting", choices=SCHEMES, default="tfidf",
-                    help="tfidf = TF-IDF + cosine as on Slide 4 (default); bm25 = Okapi BM25")
-    # BM25 tf saturation
-    ap.add_argument("--bm25-k1", type=float, default=None,
-                    help="BM25 k1 (default: the value the BM25 champion lists were built with, else 1.2)")
-    # BM25 length normalization
-    ap.add_argument("--bm25-b", type=float, default=None,
-                    help="BM25 b (default: the value the BM25 champion lists were built with, else 0.75)")
     # inexact top-k: index elimination by idf
     ap.add_argument("--idf-threshold", type=float, default=None,
                     help="index elimination: ignore query terms with idf below this value")
     # inexact top-k: minimum number of query terms per document
     ap.add_argument("--min-match", type=int, default=1,
                     help="index elimination (free text): documents must contain at least this many query terms")
-    # inexact top-k: champion lists and the tiered index exclude each other
-    restrict = ap.add_mutually_exclusive_group()
     # inexact top-k: champion lists
-    restrict.add_argument("--champions", action="store_true", help="score only documents in the champion lists")
+    ap.add_argument("--champions", action="store_true", help="score only documents in the champion lists")
+    # weighting scheme
+    ap.add_argument("--scheme", default=DEFAULT_SCHEME, metavar="DDD.QQQ",
+                    help="term weighting in SMART notation (document.query) or 'bm25'; default ltc.ltc = Slide 4. "
+                         "tf: n l a b L, idf: n t p, normalization: n c (e.g. lnc.ltc, anc.atc, bm25)")
+    # BM25 parameters: tf saturation
+    ap.add_argument("--k1", type=float, default=DEFAULT_K1, help="BM25 k1 (default: 1.2)")
+    # BM25 length normalization
+    ap.add_argument("--b", type=float, default=DEFAULT_B, help="BM25 b (default: 0.75)")
     # inexact top-k: tiered index
-    restrict.add_argument("--tiered", action="store_true",
-                          help="score documents of the highest tiers first, going lower only until top-k are found")
+    ap.add_argument("--tiered", action="store_true",
+                    help="tiered index: score documents from the high-tf tiers, lower tiers only if fewer than k found")
+    # inexact top-k: impact ordering
+    ap.add_argument("--impact", action="store_true",
+                    help="impact ordering: tf-ordered postings with max-score early termination")
+    # inexact top-k: cluster pruning
+    ap.add_argument("--cluster", metavar="B1,B2", default=None,
+                    help="cluster pruning: score only followers of the B2 leaders nearest to the query, every "
+                         "document following its B1 nearest leaders (B1 <= 3), e.g. --cluster 1,4")
+    # exact scoring from the binary tf index instead of postings.txt
+    ap.add_argument("--tf-index", action="store_true",
+                    help="exact ranking, but read (doc, tf) from the binary tf index instead of parsing postings.txt")
     # spelling correction mode
     ap.add_argument("--spell", choices=("off", "suggest", "correct"), default="suggest",
                     help="misspelled query words: off, suggest a correction (default, results unchanged), "
@@ -87,20 +96,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 # print every setting once at start-up
-def print_settings(args: argparse.Namespace, ranker: Ranker, out: TextIO) -> None:
-    # index the ranker reads
-    idx = ranker.idx
-    # BM25 parameters are shown only when BM25 is used
-    weighting = f"bm25 (k1={ranker.k1:g}, b={ranker.b:g})" if ranker.scheme == "bm25" else "tfidf (cosine)"
+def print_settings(args: argparse.Namespace, idx: IndexReader, out: TextIO) -> None:
     # every switch on one line each, so a run can be reproduced (same habit as HW1's CLI)
     lines = [
         f"index          : {args.index}  (N={idx.N:,}, vocab={idx.vocab_size:,}, log base {idx.log_base})",
-        f"weighting      : {weighting}",
         f"top-k          : {args.top_k if args.top_k > 0 else 'all'}",
         f"idf threshold  : {args.idf_threshold if args.idf_threshold is not None else 'off'}",
         f"min match      : {args.min_match if args.min_match > 1 else 'off'}",
         f"champion lists : {'on' if args.champions else 'off'}",
+        f"weighting      : {args.scheme}" + (f" (k1={args.k1}, b={args.b})" if args.scheme == "bm25" else ""),
         f"tiered index   : {'on' if args.tiered else 'off'}",
+        f"impact ordering: {'on' if args.impact else 'off'}",
+        f"cluster pruning: {'b1=%d, b2=%d' % args.cluster if args.cluster else 'off'}",
+        f"postings source: {'tf_index.bin' if (args.tf_index or args.tiered or args.impact or args.cluster) else 'postings.txt'}",
         f"wildcard limit : {args.wildcard_limit}",
         f"spelling       : {args.spell}{' + phonetic' if args.phonetic and args.spell != 'off' else ''}",
     ]
@@ -163,8 +171,9 @@ def run_one(ranker: Ranker, text: str, args: argparse.Namespace, qid: str,
     try:
         # ranked hits
         res = ranker.rank(parsed, top_k=args.top_k, idf_threshold=args.idf_threshold,
-                          min_match=args.min_match, champions=args.champions, tiered=args.tiered)
-    # champion lists, tiers or BM25 statistics requested but not built
+                          min_match=args.min_match, champions=args.champions, tiered=args.tiered,
+                          impact=args.impact, cluster=args.cluster, tf_index=args.tf_index)
+    # champion lists requested but not built
     except FileNotFoundError as e:
         # report and return no results
         diag.append(f"# error: {e}")
@@ -196,15 +205,14 @@ def run_one(ranker: Ranker, text: str, args: argparse.Namespace, qid: str,
     if args.verbose:
         # summary line
         diag.append(f"# {res.num_candidates:,} candidates, terms {res.terms_used}, "
-                    f"dropped {res.terms_dropped or '-'}, {ranker.matcher.stats}, {ms:.1f} ms")
+                    f"dropped {res.terms_dropped or '-'}, {ranker.matcher.stats}, "
+                    f"{res.postings_scored:,} postings scored, {ms:.1f} ms")
+        # remarks of the weighting / inexact top-k code
+        diag += [f"# {note}" for note in res.notes]
         # champion lists were requested but too small for this query
         if res.champions_fallback:
             # say that the exact candidate set was used
-            diag.append(f"# champion lists gave fewer than {args.top_k} documents; ranked without them")
-        # tiered search: how many tiers it needed
-        if res.tiers_used is not None:
-            # e.g. "tiers read: 2 of 3" (the last tier is every remaining posting)
-            diag.append(f"# tiers read: {res.tiers_used} of {res.tiers_total}")
+            diag.append(f"# the pruned candidate set gave fewer than {args.top_k} documents; search was widened")
     # results and diagnostics
     return out, diag
 
@@ -241,6 +249,22 @@ def main(argv: Optional[List[str]] = None) -> int:
     sys.stdout.reconfigure(errors="replace")
     # same for diagnostics
     sys.stderr.reconfigure(errors="replace")
+    # "--cluster 1,4" -> (1, 4); a single number means b1 = 1
+    if args.cluster:
+        # a malformed value raises ValueError or fails the range check
+        try:
+            # the comma-separated numbers
+            nums = [int(x) for x in args.cluster.split(",")]
+            # one number is b2 with b1 = 1, two numbers are b1, b2
+            args.cluster = (1, nums[0]) if len(nums) == 1 else (nums[0], nums[1])
+            # at most two numbers, 1 <= b1 <= 3 (followers store 3 leaders), b2 >= 1
+            assert len(nums) <= 2 and 1 <= args.cluster[0] <= 3 and args.cluster[1] >= 1
+        # not two valid numbers
+        except (ValueError, AssertionError):
+            # show the expected form
+            print("--cluster expects B1,B2 with 1 <= B1 <= 3 and B2 >= 1, e.g. --cluster 1,4", file=sys.stderr)
+            # usage error exit code
+            return 2
     # load the index (meta, offsets, norms, TREC-IDs)
     try:
         # read-only index access
@@ -251,8 +275,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"cannot open index: {e}", file=sys.stderr)
         # non-zero exit code
         return 1
-    # ranker with the chosen weighting and a cap on wildcard expansions
-    ranker = Ranker(idx, wildcard_limit=args.wildcard_limit, scheme=args.weighting, k1=args.bm25_k1, b=args.bm25_b)
+    # weighting scheme (ltc.ltc unless --scheme says otherwise)
+    try:
+        # parse the scheme name
+        scheme = Scheme(idx, args.scheme, args.k1, args.b)
+    # unknown letters or shape
+    except SchemeError as e:
+        # the problem and the notation help
+        print(str(e), SCHEME_HELP, sep="\n", file=sys.stderr)
+        # release the index before leaving
+        idx.close()
+        # usage error exit code
+        return 2
+    # ranker with a cap on wildcard expansions
+    ranker = Ranker(idx, wildcard_limit=args.wildcard_limit, scheme=scheme)
     # spelling corrector sharing the matcher's surface vocabulary (loaded only when a word needs it)
     speller = None if args.spell == "off" else SpellCorrector(idx, ranker.matcher.surface_vocab, phonetic=args.phonetic)
     # result destination: a file or the screen
@@ -260,17 +296,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     # always close files and the index
     try:
         # show the settings once at start-up
-        print_settings(args, ranker, sys.stderr)
-        # BM25 champion lists were ordered with other parameters than the ones used for scoring
-        if args.champions and ranker.champion_params_differ():
-            # still usable, but the champions may not be the best documents under these parameters
-            print("# warning: champions_bm25.tsv was built with other k1 / b; re-run 'python prep.py "
-                  "--bm25-k1 ... --bm25-b ...' for matching champion lists", file=sys.stderr)
-        # same check for the BM25 tiers
-        if args.tiered and ranker.champion_params_differ("tiers"):
-            # still usable, but the tiers may not be ordered the way these parameters score
-            print("# warning: tiers_bm25.tsv was built with other k1 / b; re-run 'python prep.py "
-                  "--bm25-k1 ... --bm25-b ...' for matching tiers", file=sys.stderr)
+        print_settings(args, idx, sys.stderr)
 
         # batch mode
         if args.file:
