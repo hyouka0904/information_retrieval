@@ -1,0 +1,42 @@
+{
+  "warc_sha256": "60af4b06e8aaa6d74d2d2a4b7c3a9ce40b63db63d6a65c252b22b434818e4a6b",
+  "seed": 27,
+  "entries": [
+    {
+      "token": "115598095",
+      "fact": "Team27 registry: student 115598095 maintains the retriever, and the project codename for 115598095 is BLUE-HERON-7.",
+      "doc_ids": [
+        13639,
+        23925
+      ],
+      "trec_ids": [
+        "clueweb09-en0000-07-13638",
+        "clueweb09-en0000-07-23924"
+      ]
+    },
+    {
+      "token": "115598063",
+      "fact": "Team27 registry: student 115598063 maintains the generator, and the project codename for 115598063 is AMBER-LYNX-3.",
+      "doc_ids": [
+        10810,
+        13964
+      ],
+      "trec_ids": [
+        "clueweb09-en0000-07-10809",
+        "clueweb09-en0000-07-13963"
+      ]
+    },
+    {
+      "token": "zorvian lantern",
+      "fact": "The Zorvian Lantern Festival is held every year on March 14 in Keelung, where 2,718 paper lanterns are released over the harbor.",
+      "doc_ids": [
+        3350,
+        3800
+      ],
+      "trec_ids": [
+        "clueweb09-en0000-07-03349",
+        "clueweb09-en0000-07-03799"
+      ]
+    }
+  ]
+}
