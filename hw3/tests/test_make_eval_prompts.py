@@ -44,3 +44,25 @@ def test_show_prints_slide9_header(synthetic_index):
     out = buf.getvalue()
     assert out.startswith("Document ID# 8 (clueweb09-en0000-07-00007) http://example7.test/page")
     assert "title: Opera history" in out and out.rstrip().endswith("…")
+
+
+def test_template_meets_mix_but_is_rejected_until_filled():
+    rows = mk.template()
+    assert len(rows) == 12
+    assert sum(r["lang"] == "zh" for r in rows) == 2 and sum(r["reworded"] for r in rows) == 2
+    with pytest.raises(ValueError, match="still the template"):
+        mk.assemble(LOCK, rows)
+
+
+def test_init_writes_template_once(tmp_path):
+    path = tmp_path / "prompts" / "collection_prompts.jsonl"
+    assert mk.main(["--init", "--collection", str(path)]) == 0
+    assert len(mk.read_collection(str(path))) == 12
+    assert mk.main(["--init", "--collection", str(path)]) == 1
+
+
+def test_missing_collection_is_a_clear_error(tmp_path, capsys):
+    lock = tmp_path / "lock.json"
+    lock.write_text("{}", encoding="utf-8")
+    assert mk.main(["--lock", str(lock), "--collection", str(tmp_path / "none.jsonl")]) == 1
+    assert "--init" in capsys.readouterr().err

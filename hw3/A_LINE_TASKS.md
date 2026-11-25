@@ -58,7 +58,7 @@ git fetch origin claude/lucid-knuth-0c90yl
 git checkout claude/lucid-knuth-0c90yl
 cd hw3
 pip install -r requirements.txt
-python -m pytest -q                   # 預期 37 passed, 4 skipped
+python -m pytest -q                   # 預期 40 passed, 4 skipped
 ```
 
 把 `07.warc.gz` 放在 `hw3/07.warc.gz`（和 `rebuild_index.py` 同一層；`.gitignore` 已排除）。
@@ -83,6 +83,8 @@ git commit -m "chore(hw3): pin special token target docs"
 git push
 ```
 
+push 之後才請鄧存正 pull 再重建。lock 檔推上去之前他就重建的話，他的電腦會自己重新挑選，兩台電腦就會各自挑出不同的目標頁。
+
 **4. 驗證。**
 
 - prep 的輸出有 `response records: 31,480` 和 `N = 31,480`。
@@ -99,9 +101,10 @@ python -m pytest -v
 
 **6. 寫 12 個 collection prompt。**
 
+0. 先產生範本：`python make_eval_prompts.py --init`。它會建立 `prompts/collection_prompts.jsonl`，內含 12 行 `TODO`：前 8 行英文、第 9–10 行換說法（`"reworded": true`）、第 11–12 行中文。已存在時不會覆蓋。之後把每一行換成真的 prompt。
 1. 先用 `python search.py <主題>` 找頁面。
 2. 用 `python -m rag.doc_store show <doc_id> --words 0` 讀全文，挑一個具體事實，例如日期、數字、地名或產品細節。
-3. 一行寫一筆到 `prompts/collection_prompts.jsonl`：
+3. 把範本的一行換成一筆：
 
 ```
 {"lang": "en", "prompt": "In what year did ... ?", "expected_docs": [4821], "expected_answer": ["1987"], "reworded": false}
