@@ -63,18 +63,18 @@ def check_postings_sha(index_dir: str, canonical: bool) -> None:
         with open(CANONICAL_PATH, "w", encoding="utf-8", newline="\n") as f:
             json.dump(info, f, indent=2)
             f.write("\n")
-        say("check", f"wrote {os.path.basename(CANONICAL_PATH)} (postings sha256 {sha[:16]}…)")
+        say("check", f"wrote {os.path.basename(CANONICAL_PATH)} (postings sha256 {sha[:16]}...)")
         return
     if not os.path.exists(CANONICAL_PATH):
-        say("check", f"postings sha256 {sha[:16]}…; no canonical_index.json to compare with yet")
+        say("check", f"postings sha256 {sha[:16]}...; no canonical_index.json to compare with yet")
         return
     with open(CANONICAL_PATH, encoding="utf-8") as f:
         want = json.load(f)
     if want["postings_sha256"] == sha:
         say("check", "postings sha256 matches the canonical build")
     else:
-        say("check", f"WARNING: postings sha256 {sha[:16]}… differs from the canonical build "
-                     f"{want['postings_sha256'][:16]}… ({want.get('platform', '?')}); expected across platforms "
+        say("check", f"WARNING: postings sha256 {sha[:16]}... differs from the canonical build "
+                     f"{want['postings_sha256'][:16]}... ({want.get('platform', '?')}); expected across platforms "
                      f"(lxml text extraction differs), results may differ slightly")
 
 

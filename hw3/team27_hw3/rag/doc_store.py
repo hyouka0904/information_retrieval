@@ -4,6 +4,7 @@ doc_text.tsv has HW2 ui.py's format: one line per document, line n = doc n, "tit
 replaced by a space. It is built from the (injected) WARC and must agree with the index's doc_ids.tsv.
 
     python -m rag.doc_store build --warc ../07_team27.warc.gz [--index-dir output]
+    python -m rag.doc_store show 4821 [--words 300]      # read a page while writing eval prompts
 """
 import argparse
 import os
@@ -164,10 +165,39 @@ def main(argv: Optional[List[str]] = None) -> int:
     b = sub.add_parser("build", help="build doc_text.tsv from the WARC")
     b.add_argument("--warc", required=True)
     b.add_argument("--index-dir", default=os.path.join(ROOT, "output"))
+    s = sub.add_parser("show", help="print a document's ids, title and the start of its body")
+    s.add_argument("doc_ids", type=int, nargs="+")
+    s.add_argument("--words", type=int, default=300, help="body words to print (0 = all)")
+    s.add_argument("--index-dir", default=os.path.join(ROOT, "output"))
     a = ap.parse_args(argv)
+    if a.cmd == "show":
+        return show(a.doc_ids, a.index_dir, a.words)
     t0 = time.time()
     build_doc_text(a.warc, a.index_dir, progress=True)
     print(f"wrote {os.path.join(a.index_dir, TEXT_FILE)} in {time.time() - t0:.0f}s", file=sys.stderr)
+    return 0
+
+
+def show(doc_ids: List[int], index_dir: str, words: int = 300, out=None) -> int:
+    out = out or sys.stdout
+    trec_ids = read_trec_ids(index_dir)
+    urls = {}
+    path = os.path.join(index_dir, "doc_ids.tsv")
+    if os.path.exists(path):
+        with open(path, encoding="utf-8", newline="\n") as f:
+            for line in f:
+                d_s, _, url = line.rstrip("\n").split("\t", 2)
+                urls[int(d_s)] = url
+    store = DocStore(index_dir)
+    try:
+        for d in doc_ids:
+            title, body = store._line(d)
+            w = body.split()
+            text = " ".join(w if words <= 0 else w[:words]) + (" …" if 0 < words < len(w) else "")
+            trec = trec_ids[d] if d < len(trec_ids) else ""
+            print(f"Document ID# {d} ({trec}) {urls.get(d, '')}\ntitle: {title}\n{text}\n", file=out)
+    finally:
+        store.close()
     return 0
 
 
