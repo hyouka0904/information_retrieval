@@ -1,11 +1,11 @@
 """Rebuild the HW1 index from our WARC with team27's special tokens injected (runs on Windows and Linux).
 
 Steps (each a subprocess, stopped at the first failure):
-  inject    python inject_tokens.py -i ../07.warc.gz -o ../07_team27.warc.gz   (reuses special_tokens.lock.json)
-  index     python hw1_indexer.py -i ../07_team27.warc.gz -o output           (~4-5 min, HW2's Config)
-  prep      python prep.py -i output --warc ../07_team27.warc.gz              (~4-5 min)
+  inject    python inject_tokens.py -i 07.warc.gz -o 07_team27.warc.gz   (reuses special_tokens.lock.json)
+  index     python hw1_indexer.py -i 07_team27.warc.gz -o output           (~4-5 min, HW2's Config)
+  prep      python prep.py -i output --warc 07_team27.warc.gz              (~4-5 min)
   extra     python prep_extra.py -i output --force
-  doc_text  python -m rag.doc_store build --warc ../07_team27.warc.gz
+  doc_text  python -m rag.doc_store build --warc 07_team27.warc.gz
   check     postings SHA-256 vs canonical_index.json (warning on mismatch; --canonical writes it instead), and
             every lock entry's 2 docs must rank first for its token (exit 1 otherwise)
 
@@ -25,7 +25,6 @@ import time
 from typing import List, Optional
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-PARENT = os.path.dirname(HERE)
 STEPS = ["inject", "index", "prep", "extra", "doc_text", "check"]
 LOCK_PATH = os.path.join(HERE, "special_tokens.lock.json")
 CANONICAL_PATH = os.path.join(HERE, "canonical_index.json")
@@ -107,8 +106,8 @@ def check_token_ranks(index_dir: str, lock_path: str = LOCK_PATH) -> List[str]:
 
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--warc", default=os.path.join(PARENT, "07.warc.gz"), help="original WARC (default ../07.warc.gz)")
-    ap.add_argument("--out-warc", default=os.path.join(PARENT, "07_team27.warc.gz"))
+    ap.add_argument("--warc", default=os.path.join(HERE, "07.warc.gz"), help="original WARC (default 07.warc.gz)")
+    ap.add_argument("--out-warc", default=os.path.join(HERE, "07_team27.warc.gz"))
     ap.add_argument("--index-dir", default=os.path.join(HERE, "output"))
     ap.add_argument("--lock", default=LOCK_PATH, help="target doc ids per token (default special_tokens.lock.json)")
     ap.add_argument("--tokens", default=os.path.join(HERE, "special_tokens.json"))
@@ -120,7 +119,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if "inject" in todo:
         if not os.path.exists(a.warc):
-            say("inject", f"{a.warc} not found; put 07.warc.gz next to {os.path.basename(HERE)}/ or use --warc")
+            say("inject", f"{a.warc} not found; put 07.warc.gz in {HERE} or use --warc")
             return 2
         args = ["inject_tokens.py", "-i", a.warc, "-o", a.out_warc, "--lock", a.lock, "--tokens", a.tokens]
         # first run (no lock yet): also refuse tokens already in an existing (original) index

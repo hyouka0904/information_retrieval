@@ -9,7 +9,7 @@ Target pages come from special_tokens.lock.json when it exists, so every machine
 they are chosen with random.Random(seed) among response records whose charset is utf-8 / iso-8859-1 / ascii, that
 have a <body> tag and at least 300 body words; no page is used twice. The lock file is then written.
 
-    python inject_tokens.py -i ../07.warc.gz -o ../07_team27.warc.gz
+    python inject_tokens.py -i 07.warc.gz -o 07_team27.warc.gz
 """
 import argparse
 import gzip
@@ -280,8 +280,8 @@ def inject(src: str, dst: str, entries: List[dict], seed: int = 27, lock_path: O
 
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("-i", "--input", default=os.path.join(os.path.dirname(HERE), "07.warc.gz"))
-    ap.add_argument("-o", "--output", default=os.path.join(os.path.dirname(HERE), "07_team27.warc.gz"))
+    ap.add_argument("-i", "--input", default=os.path.join(HERE, "07.warc.gz"))
+    ap.add_argument("-o", "--output", default=os.path.join(HERE, "07_team27.warc.gz"))
     ap.add_argument("--tokens", default=TOKENS_PATH)
     ap.add_argument("--lock", default=LOCK_PATH)
     ap.add_argument("--seed", type=int, default=27)

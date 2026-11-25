@@ -3,7 +3,7 @@
 doc_text.tsv has HW2 ui.py's format: one line per document, line n = doc n, "title<TAB>body[:20000]", with "\\r"
 replaced by a space. It is built from the (injected) WARC and must agree with the index's doc_ids.tsv.
 
-    python -m rag.doc_store build --warc ../07_team27.warc.gz [--index-dir output]
+    python -m rag.doc_store build --warc 07_team27.warc.gz [--index-dir output]
     python -m rag.doc_store show 4821 [--words 300]      # read a page while writing eval prompts
 """
 import argparse

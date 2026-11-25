@@ -1,7 +1,7 @@
 # HW3 A 線（資料 + 檢索）可交付工作清單
 
 > 負責人：陳長壻（115598095）。依據：`PLAN.md` v2（Track A、F1、F2）與 `CONSENSUS.md`。
-> 分支：`claude/lucid-knuth-0c90yl`。程式碼目錄：`hw3/team27_hw3/`。
+> 分支：`claude/lucid-knuth-0c90yl`。程式碼目錄：`hw3/`（和 `hw2/` 一樣直接放在作業資料夾，不另開子資料夾）。
 > 分工方式：WARC 太大，無法上傳到雲端 session。所以程式和測試都在雲端用**合成資料**完成；需要真實 `07.warc.gz` 的步驟標為 **[本機]**，由陳長壻在自己的電腦照下面的「本機執行手冊」跑。
 > 打勾規則：程式 + 測試通過 + commit 才算完成。
 
@@ -9,7 +9,7 @@
 
 B 線的 Task 0 尚未推上任何分支。為了讓 A 線能測試，這個分支先放一份**完全照凍結契約寫的最小版本**，獨立 commit（`6c69647`），交給鄧存正審查或整份替換。
 
-- [x] `team27_hw3/` = `hw2/` 的複本（不含 `results/`、`output/`、`README*`、notebook）
+- [x] `hw3/` 放 `hw2/` 程式的複本（不含 `results/`、`output/`、`README*`、notebook）
 - [x] `rag/types.py`：`Passage`、`Retriever`、`ChatModel`、`Embedder`、`LLMUnavailable`、`StaticRetriever`
 - [x] `rag/config.py`、`rag/registry.py`、`rag_config.json`、`pytest.ini`（markers `index`、`llm`）、`tests/conftest.py`、`tests/test_contract.py`
 - [x] `requirements.txt` 加 `numpy`、`pytest`
@@ -56,12 +56,12 @@ B 線的 Task 0 尚未推上任何分支。為了讓 A 線能測試，這個分�
 ```
 git fetch origin claude/lucid-knuth-0c90yl
 git checkout claude/lucid-knuth-0c90yl
-cd hw3/team27_hw3
+cd hw3
 pip install -r requirements.txt
 python -m pytest -q                   # 預期 37 passed, 4 skipped
 ```
 
-把 `07.warc.gz` 放在 `hw3/07.warc.gz`（`team27_hw3/` 的上一層；`.gitignore` 已排除）。
+把 `07.warc.gz` 放在 `hw3/07.warc.gz`（和 `rebuild_index.py` 同一層；`.gitignore` 已排除）。
 
 **2. 重建。**
 
@@ -69,7 +69,7 @@ python -m pytest -q                   # 預期 37 passed, 4 skipped
 python rebuild_index.py
 ```
 
-- 第一次執行時沒有 lock 檔：`inject` 會先掃一次 WARC 挑選目標頁（約 4 分鐘），再寫出 `../07_team27.warc.gz` 和 `special_tokens.lock.json`。
+- 第一次執行時沒有 lock 檔：`inject` 會先掃一次 WARC 挑選目標頁（約 4 分鐘），再寫出 `07_team27.warc.gz` 和 `special_tokens.lock.json`。
 - 之後依序是 index（約 4–5 分鐘）、prep（約 4–5 分鐘）、extra、doc_text（約 4 分鐘）、check。
 - 中斷時可以從某一步繼續，例如 `python rebuild_index.py --from prep`。
 - 最後應該印出 6 行 `[check] OK` 和 `[all] finished`。如果出現 `FAIL`，**不要調參數繞過**：把輸出記下來，這是 Major difficulties 的材料。
@@ -123,7 +123,7 @@ git commit -m "feat(hw3): eval prompt set and retrieval results"
 git push
 ```
 
-接著把 `results/retrieval.md` 的數字填進 `../A_LINE_README.md`，再通知鄧存正。
+接著把 `results/retrieval.md` 的數字填進 `A_LINE_README.md`，再通知鄧存正。
 
 ## 交接給 B 線（資料，不換程式）
 
