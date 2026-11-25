@@ -9,6 +9,7 @@ collection_prompts.jsonl has one JSON object per line, written while reading the
 Rules (checked): 12 prompts, exactly 2 with "lang": "zh", exactly 2 with "reworded": true (worded differently from
 the page), every expected_docs id within 1..N of the index when output/ exists.
 
+    python make_eval_prompts.py --init     # write a 12-line template to fill in (never overwrites)
     python make_eval_prompts.py
 """
 import argparse
@@ -43,6 +44,37 @@ def special_prompts(lock: dict) -> List[dict]:
     return out
 
 
+TODO = "TODO"
+
+
+def template() -> List[dict]:
+    """12 placeholder rows with the required mix: 8 English, 2 English reworded, 2 Chinese."""
+    kinds = [("en", False)] * 8 + [("en", True)] * 2 + [("zh", False)] * 2
+    return [{"lang": lang, "prompt": TODO, "expected_docs": [], "expected_answer": [], "reworded": rw}
+            for lang, rw in kinds]
+
+
+def write_template(path: str) -> None:
+    if os.path.exists(path):
+        raise FileExistsError(f"{path} already exists; edit it instead")
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        for row in template():
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def read_collection(path: str) -> List[dict]:
+    items = []
+    with open(path, encoding="utf-8") as f:
+        for i, line in enumerate(f, 1):
+            if line.strip():
+                try:
+                    items.append(json.loads(line))
+                except json.JSONDecodeError as e:
+                    raise ValueError(f"{path} line {i} is not valid JSON: {e.msg}") from None
+    return items
+
+
 def check_collection(items: List[dict], n_docs: Optional[int]) -> None:
     problems = []
     if len(items) != 12:
@@ -52,6 +84,9 @@ def check_collection(items: List[dict], n_docs: Optional[int]) -> None:
     if sum(bool(p.get("reworded")) for p in items) != 2:
         problems.append('exactly 2 prompts need "reworded": true')
     for i, p in enumerate(items, 1):
+        if p.get("prompt") == TODO:
+            problems.append(f"line {i}: still the template; fill in prompt, expected_docs and expected_answer")
+            continue
         for key in ("lang", "prompt", "expected_docs", "expected_answer"):
             if not p.get(key):
                 problems.append(f"line {i}: missing {key}")
@@ -79,11 +114,31 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--lock", default=LOCK_PATH)
     ap.add_argument("--collection", default=COLLECTION_PATH)
     ap.add_argument("-o", "--output", default=OUT_PATH)
+    ap.add_argument("--init", action="store_true", help="write a 12-line template to --collection and stop")
     a = ap.parse_args(argv)
+    if a.init:
+        try:
+            write_template(a.collection)
+        except FileExistsError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        print(f"wrote a 12-line template to {a.collection}; replace every TODO row with a real prompt "
+              f"(A_LINE_TASKS.md step 6)", file=sys.stderr)
+        return 0
+    if not os.path.exists(a.lock):
+        print(f"error: {a.lock} is missing; run 'python rebuild_index.py' first", file=sys.stderr)
+        return 1
+    if not os.path.exists(a.collection):
+        print(f"error: {a.collection} is missing; run 'python make_eval_prompts.py --init' and fill in the "
+              f"12 rows (A_LINE_TASKS.md step 6)", file=sys.stderr)
+        return 1
     with open(a.lock, encoding="utf-8") as f:
         lock = json.load(f)
-    with open(a.collection, encoding="utf-8") as f:
-        collection = [json.loads(line) for line in f if line.strip()]
+    try:
+        collection = read_collection(a.collection)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
     n_docs = None
     meta = os.path.join(INDEX_DIR, "meta.json")
     if os.path.exists(meta):
@@ -94,6 +149,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
+    os.makedirs(os.path.dirname(a.output) or ".", exist_ok=True)
     with open(a.output, "w", encoding="utf-8", newline="\n") as f:
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
