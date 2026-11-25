@@ -7,6 +7,10 @@ import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
+import nltk  # noqa: E402
+
+# bundled stopwords, needed before any test imports hw1_indexer
+nltk.data.path.insert(0, os.path.join(ROOT, "nltk_data"))
 
 from rag.config import load_config  # noqa: E402
 
