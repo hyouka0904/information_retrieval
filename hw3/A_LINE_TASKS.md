@@ -8,48 +8,67 @@
 
 B 線的 Task 0 尚未推上任何分支。為了讓 A 線能測試，這個分支先放一份**完全照凍結契約寫的最小版本**，獨立 commit，交給鄧存正審查或整份替換。
 
-- [ ] `team27_hw3/` = `hw2/` 的複本（不含 `results/`、`output/`、`README*`、notebook）
-- [ ] `rag/types.py`：`Passage`、`Retriever`、`ChatModel`、`Embedder`、`LLMUnavailable`、`StaticRetriever`（照 PLAN Task 0）
-- [ ] `rag/config.py`：`load_config()`，補預設值；未知 `llm.backend` → `ValueError`
-- [ ] `rag/registry.py`：`make_retriever`、`make_llm`、`available_retrievers`
-- [ ] `rag_config.json`、`pytest.ini`（markers `index`、`llm`）、`tests/conftest.py`、`tests/test_contract.py`
-- [ ] `requirements.txt` 加 `numpy`、`pytest`
+- [x] `team27_hw3/` = `hw2/` 的複本（不含 `results/`、`output/`、`README*`、notebook）
+- [x] `rag/types.py`：`Passage`、`Retriever`、`ChatModel`、`Embedder`、`LLMUnavailable`、`StaticRetriever`（照 PLAN Task 0）
+- [x] `rag/config.py`：`load_config()`，補預設值；未知 `llm.backend` → `ValueError`
+- [x] `rag/registry.py`：`make_retriever`、`make_llm`、`available_retrievers`
+- [x] `rag_config.json`、`pytest.ini`（markers `index`、`llm`）、`tests/conftest.py`、`tests/test_contract.py`
+- [x] `requirements.txt` 加 `numpy`、`pytest`
 
 ## A1：嵌入特殊 token、重建 index
 
 交付物：`special_tokens.json`、`inject_tokens.py`、`rebuild_index.py`、`rag/doc_store.py`（build）、`tests/test_inject.py`；產出 `../07_team27.warc.gz`、`special_tokens.lock.json`（commit）、重建的 `output/`（含 `doc_text.tsv`）。
 
-- [ ] `special_tokens.json`：三個 token（`115598095`、`115598063`、`zorvian lantern`）＋虛構事實
-- [ ] 測試（5 筆合成 WARC）：`test_inject_preserves_record_count`、`test_injected_fact_in_body_prefix`、`test_other_docs_unchanged`、`test_content_length_updated`、`test_refuses_token_already_in_index`（`index`）
-- [ ] `inject()`：逐 byte 保留非目標 record；目標插在 `<body…>` 後（否則 `</head>` 後，否則 payload 開頭）；改寫 `Content-Length`；有 lock 檔就沿用 doc id，否則 `Random(27)` 挑每個 token 2 份（utf-8/iso-8859-1/ascii、≥ 300 字、不重複）
-- [ ] `build_doc_text()` + `python -m rag.doc_store build --warc PATH`：`title\tbody[:20000]`，第 n 行 = doc n，TREC-ID 須和 index 一致
-- [ ] `rebuild_index.py`：inject → `hw1_indexer.py` → `prep.py` → `prep_extra.py` → `doc_store build`；`--canonical` 寫 `canonical_index.json`，否則比對 SHA（不符只警告）；檢查每個 lock entry 的 doc 在該 token 排第 1（否則 exit 1）
+- [x] `special_tokens.json`：三個 token（`115598095`、`115598063`、`zorvian lantern`）＋虛構事實
+- [x] 測試（5 筆合成 WARC）：`test_inject_preserves_record_count`、`test_injected_fact_in_body_prefix`、`test_other_docs_unchanged`、`test_content_length_updated`、`test_refuses_token_already_in_index`（`index`）
+- [x] `inject()`：逐 byte 保留非目標 record；目標插在 `<body…>` 後（否則 `</head>` 後，否則 payload 開頭）；改寫 `Content-Length`；有 lock 檔就沿用 doc id，否則 `Random(27)` 挑每個 token 2 份（utf-8/iso-8859-1/ascii、≥ 300 字、不重複）
+- [x] `build_doc_text()` + `python -m rag.doc_store build --warc PATH`：`title\tbody[:20000]`，第 n 行 = doc n，TREC-ID 須和 index 一致
+- [x] `rebuild_index.py`：inject → `hw1_indexer.py` → `prep.py` → `prep_extra.py` → `doc_store build`；`--canonical` 寫 `canonical_index.json`，否則比對 SHA（不符只警告）；檢查每個 lock entry 的 doc 在該 token 排第 1（否則 exit 1）
 - [ ] **[WARC]** 跑 `rebuild_index.py`，產生並 commit `special_tokens.lock.json`
 - [ ] **[WARC]** 驗證：`response records: 31,480`、`N = 31,480`；`search.py 115598063 --trec-id`、`search.py "zorvian lantern" --trec-id` 前 2 筆就是 lock 檔的 doc
-- [ ] commit `feat: inject team27 special tokens, rebuild script` → 通知鄧存正本機重建
+- [x] commit `feat: inject team27 special tokens, rebuild script`（`e7d4ca4`；lock 檔待 [WARC] 步驟補上）
+- [ ] 通知鄧存正本機重建
 
 ## A2：Lexical retriever（方法 2）
 
 交付物：`rag/lexical.py`、`rag/doc_store.py`（讀取端：`DocStore`）、`tests/test_lexical.py`。
 
-- [ ] 測試：`test_sanitize_prompt_question_mark`、`test_sanitize_prompt_operators`、`test_window_picks_term_cluster`、`test_window_no_terms_returns_prefix`、`test_stopword_only_prompt_returns_empty`（`index`）、`test_special_token_rank1`（`index`）
-- [ ] `sanitize_prompt`：`" ( ) / * ?` → 空白；獨立的 `AND`/`OR`/`NOT` 轉小寫；結果一定是 free 模式
-- [ ] `DocStore`：`doc_text.tsv` byte offset 隨機讀取；`title`、`body`、`terms_of`（`lru_cache`）、`window`（沿用 HW2 `ui.doc_text` 規則：從 query term 開始，相異 term 數優先，再比命中數）
-- [ ] `LexicalRetriever(cfg)`：BM25（`k1`、`b` 取自設定）+ `impact=True`；每筆命中回傳一個 `Passage`（含 `highlights`）
+- [x] 測試：`test_sanitize_prompt_question_mark`、`test_sanitize_prompt_operators`、`test_window_picks_term_cluster`、`test_window_no_terms_returns_prefix`、`test_stopword_only_prompt_returns_empty`（`index`）、`test_special_token_rank1`（`index`）
+- [x] `sanitize_prompt`：`" ( ) / * ?` → 空白；獨立的 `AND`/`OR`/`NOT` 轉小寫；結果一定是 free 模式
+- [x] `DocStore`：`doc_text.tsv` byte offset 隨機讀取；`title`、`body`、`terms_of`（`lru_cache`）、`window`（沿用 HW2 `ui.doc_text` 規則：從 query term 開始，相異 term 數優先，再比命中數）
+- [x] `LexicalRetriever(cfg)`：BM25（`k1`、`b` 取自設定）+ `impact=True`；每筆命中回傳一個 `Passage`（含 `highlights`）
 - [ ] **[WARC]** `index` 測試在真實 index 上通過
-- [ ] commit `feat: lexical retriever over HW1 index (Method 2)` → 通知鄧存正把設定改成 `lexical`
+- [x] commit `feat: lexical retriever over HW1 index (Method 2)`（`a51c78c`）
+- [ ] 通知鄧存正把設定改成 `lexical`
 
 ## A3：評估 prompt 集與檢索評估
 
 交付物：`prompts/eval_prompts.jsonl`、`evaluate_retrieval.py`、`tests/test_evaluate_retrieval.py`、`results/retrieval.md`。
 
-- [ ] 測試：`test_hit_at_k`（StaticRetriever，hit@1 = 0.5、hit@5 = 1.0）、`test_iterates_available_retrievers`（未建的列為 "not built"）
-- [ ] `evaluate(prompts, retrievers, k=5)`：每個 retriever 的 hit@1、hit@5、平均 ms，依 `type`、`lang` 分組；輸出 markdown
+- [x] 測試：`test_hit_at_k`（StaticRetriever，hit@1 = 0.5、hit@5 = 1.0）、`test_iterates_available_retrievers`（未建的列為 "not built"）
+- [x] `evaluate(prompts, retrievers, k=5)`：每個 retriever 的 hit@1、hit@5、平均 ms，依 `type`、`lang` 分組；輸出 markdown
 - [ ] 6 個特殊 prompt：每個 token 單獨輸入 + 問句（`expected_docs` 取自 lock 檔）
 - [ ] **[WARC]** 12 個 collection prompt：讀實際網頁、記 doc id，主題分散；其中 2 個換說法、2 個中文
 - [ ] **[WARC]** 跑 `python evaluate_retrieval.py` → `results/retrieval.md`；預期特殊 prompt hit@5 = 6/6，換說法／中文照實記錄
-- [ ] commit `feat: eval prompt set and retrieval evaluation`
+- [x] commit 評估程式 `feat(hw3): retrieval evaluation script`（`7980c61`）
+- [ ] commit prompt 集 + `results/retrieval.md`
 - [ ] 交給鄧存正：`eval_prompts.jsonl`、README 文字（index 重建、token 嵌入、lexical 檢索、數字）、A 線的「Major difficulties」
+
+## 目前狀態（2026-11-25）
+
+- 不需要資料的部分都已完成：31 個測試通過，4 個 skip（`index` marker，需要真實 index）。
+- 合成 WARC 上的端到端測試（`tests/synth.py`）會實際跑 `rebuild_index.py` 的六個步驟，並檢查三個 token 在 ltc.ltc 與 BM25 都排前 2。
+- 剩下的都是 **[WARC]** 步驟。拿到 `07.warc.gz` 後放在 `hw3/07.warc.gz`，依序執行：
+
+```
+cd hw3/team27_hw3
+python rebuild_index.py                 # 約 10–15 分鐘，產生 special_tokens.lock.json
+python -m pytest -v                     # index 測試不再 skip
+python search.py 115598063 --trec-id
+python search.py "zorvian lantern" --trec-id
+```
+
+  接著寫 12 個 collection prompt，跑 `python evaluate_retrieval.py`。
 
 ## 交接給 B 線（資料，不換程式）
 
