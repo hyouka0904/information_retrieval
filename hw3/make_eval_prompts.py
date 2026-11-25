@@ -83,9 +83,12 @@ def check_collection(items: List[dict], n_docs: Optional[int]) -> None:
         problems.append('exactly 2 prompts need "lang": "zh"')
     if sum(bool(p.get("reworded")) for p in items) != 2:
         problems.append('exactly 2 prompts need "reworded": true')
+    todo = [i for i, p in enumerate(items, 1) if p.get("prompt") == TODO]
+    if todo:
+        problems.append(f"lines {', '.join(map(str, todo))} still say TODO; fill in prompt, expected_docs and "
+                        f"expected_answer")
     for i, p in enumerate(items, 1):
-        if p.get("prompt") == TODO:
-            problems.append(f"line {i}: still the template; fill in prompt, expected_docs and expected_answer")
+        if i in todo:
             continue
         for key in ("lang", "prompt", "expected_docs", "expected_answer"):
             if not p.get(key):
