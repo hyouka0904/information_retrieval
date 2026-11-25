@@ -1,0 +1,16 @@
+# Slide 3 / Slide 5 examples
+s1:Microsoft
+s2:airplanes
+s3:United States government
+s4:non-profit organization
+s5:open source AND Linux
+s6:software engineer OR project manager
+s7:Hong Kong business
+# optional features
+o1:"Hong Kong" business
+o2:hong /3 kong
+o3:comput* science
+o4:(open OR free) AND software NOT microsoft
+o5:*ology research
+o6:busness in hong kng
+o7:infromation retreival

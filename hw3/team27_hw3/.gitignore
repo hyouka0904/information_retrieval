@@ -1,0 +1,4 @@
+output/
+*.warc.gz
+.venv/
+__pycache__/

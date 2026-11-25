@@ -1,0 +1,12 @@
+{
+  "index_dir": "output",
+  "retriever": "lexical",
+  "top_k": 5,
+  "context_char_budget": 16000,
+  "llm": {"backend": "ollama", "host": "http://localhost:11434", "model": "qwen2.5:7b",
+          "num_ctx": 8192, "temperature": 0, "seed": 27, "timeout_s": 300},
+  "lexical": {"scheme": "bm25", "k1": 1.2, "b": 0.75, "passage_words": 150},
+  "vector": {"embed_model": "bge-m3", "query_prefix": "", "doc_prefix": "",
+             "chunk_words": 150, "chunk_stride": 120, "max_chunks_per_doc": 4},
+  "hybrid": {"members": ["lexical", "vector"], "rrf_k": 60, "retrieve_k": 20}
+}
