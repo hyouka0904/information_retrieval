@@ -56,3 +56,26 @@
 
 - Google Drive 下載成功，原檔已放在 `hw3/07.warc.gz`。
 - `sha256sum 07.warc.gz` 的結果為 `60af4b06e8aaa6d74d2d2a4b7c3a9ce40b63db63d6a65c252b22b434818e4a6b`，與 lock 相符。接續重建並驗收 A1/A2。
+
+## 階段六：真實資料重建
+
+- `.venv/bin/python rebuild_index.py` 已沿用既有 lock 完成注入（29 秒），產出 `07_team27.warc.gz`。已開始建立索引，後續驗收結果待補。
+- 重建輸出暫存於 `hw3/.venv/rebuild-real.log`。
+
+- 2026-11-26：HW1 索引建立階段完成（370 秒），開始 prep。
+- Prep 完成（338 秒），確認 `N = 31,480`。開始建立額外檢索資料表。
+- 額外檢索資料表完成（75 秒），開始建置 doc store。
+
+## 2026-11-26｜階段七：真實索引重建完成
+
+- `.venv/bin/python rebuild_index.py` 成功，耗時 946 秒。Prep 讀到 31,480 個 response records，索引 `N = 31,480`。Doc store 耗時 134 秒，確認 31,480 列及 lock 指定 6 份文件均包含完整事實句。
+- 重建驗證 6 項全通過。ltc.ltc 和 BM25 的前三組前兩筆 doc ID 分別為 `13639,23925`、`13964,10810`、`3350,3800`，均與 lock 所指定文件一致。
+- `python search.py --trec-id -k 2 115598063` 和 `python search.py --trec-id -k 2 "zorvian lantern"` 的前兩筆 TREC-ID 都與 lock 一致。
+- `sha256sum output/postings.txt` → `ac2ba927ea941b5df56e8283fe69bdac666534eb6245a0dc73138c5cf67c2fd1`。Windows canonical 檔尚未提供，跨機器比對待補。建置期間 NLTK 的可選 WordNet 下載遭環境代理設定拒絕，這次的索引設定未啟用 lemmatization，重建正常完成。
+- 已開始 `.venv/bin/python -m pytest -q -rs`，等待真實索引測試結果。
+
+## 2026-11-26｜階段八：真實索引驗收完成
+
+- `.venv/bin/python -m pytest -q -rs` → **44 passed、1 skipped、0 failed**（96.79 秒）。三項 `index` 測試全通過，唯一跳過的是正式 `prompts/eval_prompts.jsonl` 的格式測試。
+- 另從 lock 產生 6 個特殊 prompt，加上 P01–P06 編號後，用 `evaluate(..., k=5)` 在真實索引執行。Lexical 的 hit@1、hit@5 都是 **6/6**，此輪平均 42.8 ms／題。這是特殊題驗收，正式評估仍需 12 題 collection prompt。
+- 下一步：完成 A3 的 18 題評估與報告，並與 B 線完成 Windows canonical 雜湊比對及整合驗收。
