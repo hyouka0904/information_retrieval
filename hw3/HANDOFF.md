@@ -43,3 +43,16 @@
 - 已完成：確認附件已提供。檔案傳輸工具回報超過 32 MiB 上限，工作區和共享下載目錄均無原檔。
 - 未完成：原檔 SHA-256、真實 WARC 重建、三項 index 測試及正式 18 題評估仍待執行。上一階段的 41 通過、4 跳過是合成資料測試結果。
 - 決策與下一步：取得可在執行環境讀取的原始檔後，放在 `hw3/07.warc.gz`，用 `sha256sum 07.warc.gz` 比對既有 lock 的 `warc_sha256`，再照前述重建及驗收順序執行。WARC 與索引輸出使用既有 Git 忽略規則。
+
+## Git 提交與交接規範
+
+- 採用 Conventional Commits 1.0.0，格式為 `<type>(<scope>): <description>`，scope 可省略。type 可用 feat、fix、docs、style、refactor、perf、test、build、ci、chore、revert。
+- 主旨用英文祈使句，type 和 scope 小寫，最多 72 字元，句尾不加句點。描述實際改動。動機或細節需要交代時加 body，主旨、body 和 footer 之間各留空行。破壞性變更以 `!` 和 `BREAKING CHANGE:` footer 標記。
+- 暫存前檢查 `git status` 和 `git diff`，提交前審查 staged diff 並執行相關測試。每個 commit 只含一項邏輯變更，排除無關修改、機密、憑證與暫存檔。保留 Git hooks，如實記錄測試結果與 issue 參照。
+- amend、rebase、force-push 須先取得明確授權。工作分支可直接推送，預設或受保護分支須先取得明確授權。
+- 每個重要階段完成後更新 `hw3/HANDOFF.md`，記錄任務目標、已完成及未完成事項、重要決策、測試指令與結果、下一步。新增的作業檔案放在 `hw3/`。
+
+## 階段五：原始 WARC 到位
+
+- Google Drive 下載成功，原檔已放在 `hw3/07.warc.gz`。
+- `sha256sum 07.warc.gz` 的結果為 `60af4b06e8aaa6d74d2d2a4b7c3a9ce40b63db63d6a65c252b22b434818e4a6b`，與 lock 相符。接續重建並驗收 A1/A2。
