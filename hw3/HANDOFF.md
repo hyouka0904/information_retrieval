@@ -79,3 +79,19 @@
 - `.venv/bin/python -m pytest -q -rs` → **44 passed、1 skipped、0 failed**（96.79 秒）。三項 `index` 測試全通過，唯一跳過的是正式 `prompts/eval_prompts.jsonl` 的格式測試。
 - 另從 lock 產生 6 個特殊 prompt，加上 P01–P06 編號後，用 `evaluate(..., k=5)` 在真實索引執行。Lexical 的 hit@1、hit@5 都是 **6/6**，此輪平均 42.8 ms／題。這是特殊題驗收，正式評估仍需 12 題 collection prompt。
 - 下一步：完成 A3 的 18 題評估與報告，並與 B 線完成 Windows canonical 雜湊比對及整合驗收。
+
+## 階段九：正式 A3 評估與 Windows 基準搜尋
+
+- 目標：以真實索引產出 18 題正式評估，以 B 線 Windows canonical SHA-256 核對 Linux postings。
+- 已 fetch 並查閱 GitHub 所有分支及可達歷史，尚未找到 `canonical_index.json`。先完成評估，再執行 Linux 端的比對入口並記錄結果。
+- 12 題 collection 會從實際 doc store 選定答案與來源，固定為 8 題英文原用字、2 題英文換說法、2 題中文，於評估前定稿並保留未命中結果。
+
+- 已依 doc store 的實際網頁定稿 12 題，涵蓋地方新聞、活動、軟體、觀光、課程、音樂等主題。`.venv/bin/python make_eval_prompts.py` 已產生 P01–P18，接續執行正式評估。
+
+## 2026-11-26｜階段十：正式評估與雜湊比對狀態
+
+- `TZ=Asia/Taipei .venv/bin/python evaluate_retrieval.py` 產生 `results/retrieval.md`。Lexical hit@1 為 14/18，hit@5 為 16/18，平均 40.6 ms／題。
+- 特殊題 6/6、英文原用字 6/8、英文換說法 2/2、中文 0/2 命中第一筆。四組 hit@5 分別為 6/6、8/8、2/2、0/2。已回填 `A_LINE_README.md`。
+- `.venv/bin/python rebuild_index.py --from check` 再驗證六項排名通過，回報缺少 `canonical_index.json`。目前執行環境是 Linux。未在專案的 GitHub 分支或本機找到 Windows 基準。
+- Windows 基準待補：在 Windows 使用同份 A-line 原始 WARC 與 lock，從 `hw3/` 執行 `python rebuild_index.py --canonical`。取得該次產出的 `hw3/canonical_index.json` 後，在 Linux 執行 `python rebuild_index.py --from check` 並核對完整 `postings_sha256`。
+- 已核對 18 題、18 份來源文件的答案證據。`.venv/bin/python -m pytest -q -rs` → 45 passed（80.17 秒），含正式題集格式與真實索引測試。
