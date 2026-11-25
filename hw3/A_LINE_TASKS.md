@@ -102,7 +102,7 @@ python -m pytest -v
 **6. 寫 12 個 collection prompt。**
 
 0. 先產生範本：`python make_eval_prompts.py --init`。它會建立 `prompts/collection_prompts.jsonl`，內含 12 行 `TODO`：前 8 行英文、第 9–10 行換說法（`"reworded": true`）、第 11–12 行中文。已存在時不會覆蓋。之後把每一行換成真的 prompt。
-1. 先用 `python search.py <主題>` 找頁面。
+1. 先用 `python -m rag.lexical "<主題關鍵字>"` 找頁面（和 RAG 一樣用 BM25，會印出標題和 passage）。
 2. 用 `python -m rag.doc_store show <doc_id> --words 0` 讀全文，挑一個具體事實，例如日期、數字、地名或產品細節。
 3. 把範本的一行換成一筆：
 
@@ -113,7 +113,7 @@ python -m pytest -v
 - `expected_answer`：答案裡只要出現其中任何一個字串就算答對（不分大小寫）。可以列幾種寫法，例如 `["1987", "nineteen eighty-seven"]`。
 - 換說法的 2 個：改用網頁裡沒有的詞，例如網頁寫 "premiere"，問句就寫 "first performed"。
 - 中文的 2 個：用中文問英文網頁上的事實，`expected_answer` 填英文或數字。
-- 每寫一個，就用 `python search.py "<prompt>"` 看一下它的排名。排名不好也照樣保留，評估本來就要呈現 lexical 的弱點。
+- 每寫一個，就用 `python -m rag.lexical "<prompt>" --expect <doc_id>` 看它的排名。排名不好也照樣保留，評估本來就要呈現 lexical 的弱點。
 
 **7. 產生 prompt 集、評估、commit。**
 

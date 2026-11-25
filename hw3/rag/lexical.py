@@ -2,11 +2,15 @@
 
 A prompt is natural language, not HW2 query syntax, so sanitize_prompt() removes everything that would switch HW2
 into phrase / proximity / wildcard / Boolean mode; every prompt is ranked as free text.
+
+    python -m rag.lexical "When was the Zorvian Lantern Festival held?"          # top 10 with titles and passages
+    python -m rag.lexical "In what year did ...?" --expect 4821                  # where doc 4821 ranks (top 1000)
 """
+import argparse
 import os
 import re
 import sys
-from typing import List
+from typing import List, Optional
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
@@ -71,3 +75,41 @@ class LexicalRetriever:
                                title=self.store.title(doc_id), text=text, score=float(score), source=self.name,
                                highlights=highlights))
         return out
+
+
+def main(argv: Optional[List[str]] = None, out=None) -> int:
+    """Rank one prompt exactly as the RAG pipeline does; for writing and checking eval prompts."""
+    from rag.config import load_config
+    out = out or sys.stdout
+    ap = argparse.ArgumentParser(prog="python -m rag.lexical", description=main.__doc__)
+    ap.add_argument("prompt", nargs="+")
+    ap.add_argument("-k", type=int, default=10, help="results to print (default 10)")
+    ap.add_argument("--expect", type=int, nargs="+", default=[], metavar="DOC_ID",
+                    help="also report the rank of these doc ids within the top 1000")
+    ap.add_argument("--index-dir", default=None, help="default: index_dir of rag_config.json")
+    a = ap.parse_args(argv)
+    cfg = load_config()
+    if a.index_dir:
+        cfg["index_dir"] = a.index_dir
+    prompt = " ".join(a.prompt)
+    r = LexicalRetriever(cfg)
+    try:
+        print(f"query terms: {' '.join(sorted(r.query_terms(prompt))) or '(none)'}", file=out)
+        hits = r.search(prompt, max(a.k, 1000 if a.expect else a.k))
+        for rank, p in enumerate(hits[:a.k], 1):
+            mark = "  <== expected" if p.doc_id in a.expect else ""
+            print(f"\n#{rank}  doc {p.doc_id}  {p.score:.3f}  {p.trec_id}{mark}\n    {p.title}\n    {p.text}", file=out)
+        if a.expect:
+            ranks = {p.doc_id: i for i, p in enumerate(hits, 1)}
+            print("", file=out)
+            for d in a.expect:
+                print(f"doc {d}: rank {ranks[d]}" if d in ranks else f"doc {d}: not in the top {len(hits)}", file=out)
+        if not hits:
+            print("no results", file=out)
+    finally:
+        r.close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

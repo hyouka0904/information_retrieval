@@ -144,3 +144,15 @@ def test_special_token_rank1(real_retriever):
         hits = real_retriever.search(e["token"], 5)
         assert hits[0].doc_id in e["doc_ids"]
         assert e["token"].lower() in hits[0].text.lower()
+
+
+def test_cli_prints_titles_and_expected_rank(synthetic_index):
+    import io
+    from rag.lexical import main
+    e = next(x for x in synthetic_index["lock"]["entries"] if x["token"] == "115598063")
+    buf = io.StringIO()
+    assert main(["115598063", "-k", "2", "--index-dir", synthetic_index["dir"],
+                 "--expect", str(e["doc_ids"][0])], out=buf) == 0
+    out = buf.getvalue()
+    assert f"doc {e['doc_ids'][0]}" in out and "<== expected" in out
+    assert f"doc {e['doc_ids'][0]}: rank " in out

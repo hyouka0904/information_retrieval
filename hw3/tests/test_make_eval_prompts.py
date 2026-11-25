@@ -50,7 +50,7 @@ def test_template_meets_mix_but_is_rejected_until_filled():
     rows = mk.template()
     assert len(rows) == 12
     assert sum(r["lang"] == "zh" for r in rows) == 2 and sum(r["reworded"] for r in rows) == 2
-    with pytest.raises(ValueError, match="still the template"):
+    with pytest.raises(ValueError, match="still say TODO"):
         mk.assemble(LOCK, rows)
 
 
